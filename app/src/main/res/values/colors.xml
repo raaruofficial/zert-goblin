@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The Feral Goblin mark sits on a black cave background; the
+         adaptive-icon background matches it so the rounded master's
+         transparent corners blend seamlessly. -->
+    <color name="ic_launcher_background">#000000</color>
+</resources>

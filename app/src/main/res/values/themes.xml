@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Activity theme; the game draws the actual UI. Kept cave-dark so
+         the shell never flashes white before the game loads. -->
+    <style name="Theme.ZertGoblin" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#050807</item>
+        <item name="android:statusBarColor">#050807</item>
+        <item name="android:navigationBarColor">#050807</item>
+    </style>
+</resources>

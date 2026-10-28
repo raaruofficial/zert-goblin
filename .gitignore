@@ -1,0 +1,20 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+*.aab
+
+# Signing material — NEVER committed. The release keystore lives only in
+# the estate signing programme (~/workspace/signing-programme/) and in
+# this repo's GitHub Actions secrets.
+*.jks
+*.keystore
+keystore.properties
+keystore_base64.txt
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
