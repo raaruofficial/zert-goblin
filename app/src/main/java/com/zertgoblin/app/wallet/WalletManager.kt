@@ -110,7 +110,7 @@ class WalletManager {
             }
             when (result) {
                 is TransactionResult.Success -> {
-                    val sig = result.successPayload?.messages
+                    val sig = result.payload?.messages
                         ?.firstOrNull()?.signatures?.firstOrNull()
                     restoreConnectedState()
                     if (sig != null) Result.success(Base58.encode(sig))
@@ -149,7 +149,7 @@ class WalletManager {
         }
         when (result) {
             is TransactionResult.Success -> {
-                val signatures = result.successPayload?.signatures
+                val signatures = result.payload?.signatures
                     ?.map { Base58.encode(it) }
                 restoreConnectedState()
                 if (!signatures.isNullOrEmpty()) Result.success(signatures)

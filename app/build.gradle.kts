@@ -72,6 +72,9 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.16.0")
+    // MainActivity is a ComponentActivity (MWA's ActivityResultSender
+    // requires one); clientlib-ktx only carries this at runtime scope.
+    implementation("androidx.activity:activity-ktx:1.10.1")
     // Document-start JavaScript for the wallet-bridge shim injection.
     implementation("androidx.webkit:webkit:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

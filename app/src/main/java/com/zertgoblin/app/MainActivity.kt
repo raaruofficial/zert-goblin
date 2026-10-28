@@ -1,8 +1,8 @@
 package com.zertgoblin.app
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.os.Bundle
+import androidx.activity.ComponentActivity
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -19,7 +19,7 @@ import com.zertgoblin.app.wallet.ZertGoblinWalletBridge
  * the hosted client's; everything wallet-shaped is native (Mobile
  * Wallet Adapter against the Seeker's Seed Vault wallet).
  */
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
 
     /**
      * The Activity's single MWA sender, created first thing in
