@@ -1,7 +1,13 @@
 package com.zertgoblin.app
 
 import android.annotation.SuppressLint
+import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.activity.ComponentActivity
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -38,75 +44,142 @@ class MainActivity : ComponentActivity() {
         sender = ActivityResultSender(this)
         val app = application as ZertGoblinApp
 
-        webView = WebView(this).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.mediaPlaybackRequiresUserGesture = false
-            settings.loadWithOverviewMode = true
-            settings.useWideViewPort = true
-            // The game is a self-contained web app; no local file or
-            // content access is ever needed.
-            settings.allowFileAccess = false
-            settings.allowContentAccess = false
+        // KFC-003 (HAUNT N3 pattern): WebView construction itself
+        // can throw when the device's WebView provider is missing,
+        // disabled, or mid-update (a WebViewFactory exception).
+        // Unguarded, that throw escaped onCreate and killed the
+        // process behind a "has stopped" dialog on first launch.
+        // The whole construction/configuration block is therefore
+        // guarded; on failure the activity falls back to a native
+        // error view (webViewUnavailableView) and the bridge attach
+        // and page load are skipped entirely. The sender above is
+        // constructed before this block and is untouched (the
+        // KFC-001 placement of record).
+        val created: WebView? = try {
+            WebView(this).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                settings.loadWithOverviewMode = true
+                settings.useWideViewPort = true
+                // The game is a self-contained web app; no local file or
+                // content access is ever needed.
+                settings.allowFileAccess = false
+                settings.allowContentAccess = false
 
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    // Fallback shim injection (the shim is idempotent):
-                    // covers WebViews without document-start support.
-                    view?.evaluateJavascript(ZertGoblinWalletBridge.SHIM_JS, null)
-                }
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        // Fallback shim injection (the shim is idempotent):
+                        // covers WebViews without document-start support.
+                        view?.evaluateJavascript(ZertGoblinWalletBridge.SHIM_JS, null)
+                    }
 
-                override fun shouldOverrideUrlLoading(
-                    view: WebView?,
-                    request: WebResourceRequest?
-                ): Boolean {
-                    // Keep web navigation inside the WebView; never
-                    // hand http(s) off to a browser. Non-web schemes
-                    // are refused outright.
-                    val scheme = request?.url?.scheme ?: return true
-                    return scheme != "https" && scheme != "http"
-                }
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): Boolean {
+                        // Keep web navigation inside the WebView; never
+                        // hand http(s) off to a browser. Non-web schemes
+                        // are refused outright.
+                        val scheme = request?.url?.scheme ?: return true
+                        return scheme != "https" && scheme != "http"
+                    }
 
-                override fun onReceivedError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    error: WebResourceError?
-                ) {
-                    super.onReceivedError(view, request, error)
-                    if (request?.isForMainFrame == true && !errorPageShown) {
-                        errorPageShown = true
-                        view?.loadDataWithBaseURL(
-                            GameConfig.GAME_URL,
-                            ERROR_HTML,
-                            "text/html",
-                            "utf-8",
-                            null
-                        )
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?
+                    ) {
+                        super.onReceivedError(view, request, error)
+                        if (request?.isForMainFrame == true && !errorPageShown) {
+                            errorPageShown = true
+                            view?.loadDataWithBaseURL(
+                                GameConfig.GAME_URL,
+                                ERROR_HTML,
+                                "text/html",
+                                "utf-8",
+                                null
+                            )
+                        }
                     }
                 }
-            }
 
-            val bridge = ZertGoblinWalletBridge(
-                activity = this@MainActivity,
-                walletManager = app.walletManager,
-                sender = sender,
-                evaluateJs = { js -> runOnUiThread { evaluateJavascript(js, null) } }
-            )
-            addJavascriptInterface(bridge, GameConfig.BRIDGE_NATIVE_NAME)
-
-            // Define window.ZertGoblinWallet before any page script runs.
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                WebViewCompat.addDocumentStartJavaScript(
-                    this,
-                    ZertGoblinWalletBridge.SHIM_JS,
-                    setOf("*")
+                val bridge = ZertGoblinWalletBridge(
+                    activity = this@MainActivity,
+                    walletManager = app.walletManager,
+                    sender = sender,
+                    evaluateJs = { js -> runOnUiThread { evaluateJavascript(js, null) } }
                 )
-            }
+                addJavascriptInterface(bridge, GameConfig.BRIDGE_NATIVE_NAME)
 
-            loadUrl(GameConfig.GAME_URL)
+                // Define window.ZertGoblinWallet before any page script runs.
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    WebViewCompat.addDocumentStartJavaScript(
+                        this,
+                        ZertGoblinWalletBridge.SHIM_JS,
+                        setOf("*")
+                    )
+                }
+
+                loadUrl(GameConfig.GAME_URL)
+            }
+        } catch (e: Exception) {
+            null
         }
+        if (created == null) {
+            setContentView(webViewUnavailableView())
+            return
+        }
+        webView = created
         setContentView(webView)
+    }
+
+    /**
+     * KFC-003 fallback surface: shown when the WebView cannot even
+     * be constructed on this device (provider missing, disabled, or
+     * mid-update). Native views only — there is no WebView to render
+     * HTML with — carrying the same facts as ERROR_HTML in plain
+     * text: what happened, that wallet-held state is safe, and the
+     * one fix (enable or update Android System WebView, then
+     * relaunch). Terminal for this activity instance: no retry,
+     * no loop.
+     */
+    private fun webViewUnavailableView(): View {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int): Int = (value * density).toInt()
+
+        val title = TextView(this).apply {
+            text = "Zert Goblin needs Android WebView"
+            setTextColor(Color.rgb(0x7d, 0xd8, 0x7d))
+            textSize = 20f
+            gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val body = TextView(this).apply {
+            text = "The WebView component is unavailable or disabled " +
+                "on this device, so the game view could not start. " +
+                "Your plays, credits, and skins live on your wallet " +
+                "and are safe. Enable or update Android System " +
+                "WebView, then relaunch the app."
+            setTextColor(Color.rgb(0xd8, 0xe6, 0xdc))
+            textSize = 15f
+            gravity = Gravity.CENTER
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.rgb(0x05, 0x08, 0x07))
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            addView(title)
+            addView(
+                body,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(12) }
+            )
+        }
     }
 
     @Deprecated("Deprecated in Java")
