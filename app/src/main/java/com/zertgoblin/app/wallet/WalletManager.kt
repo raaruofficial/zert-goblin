@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * UI-facing wallet state.
@@ -49,6 +50,22 @@ sealed interface WalletUiState {
  * (see [runWalletOperation]): clientlib's transact carries no
  * timeout of its own, so an abandoned approval would otherwise sit
  * in Working forever.
+ *
+ * v0.1.4 KFC-008 CORRECTION (HAUNT v0.1.16, commit 40582dc — its
+ * §2.2 runtime verdict on v0.1.15, REPORT_V0115_WALLET, cell vr12
+ * FAIL): the v0.1.3 reconciliation cancelled the pending Deferred
+ * and let the state resolution happen behind `deferred.await()` in
+ * the caller's coroutine. clientlib's connect/transact suspension
+ * is NON-COOPERATIVE: cancelling the Deferred does not wake the
+ * awaiter while the underlying call is parked, so the app sat in
+ * Working past the grace window (the 120 s backstop still worked —
+ * it fires on the awaiting caller — but two minutes is not a
+ * foreground cure). The reconciler now resolves the UI state
+ * DIRECTLY from session truth after the grace window,
+ * generation-claimed (see [claimResolution]) so neither a wrapper's
+ * late resolution nor a zombie operation's late writes/delivery
+ * can overwrite it; the Deferred cancellation remains, as hygiene
+ * only. The 120 s backstop is unchanged.
  */
 class WalletManager {
 
@@ -107,42 +124,136 @@ class WalletManager {
     @Volatile
     private var pendingOperationSinceMs: Long = 0L
 
+    /** Which kind of operation is in flight — the reconciler's
+     *  direct resolution differs by kind (connect → Error;
+     *  sign/pay → restore from session truth). */
+    private enum class PendingOperationKind { CONNECT, SIGN, PAY }
+
+    @Volatile
+    private var pendingKind: PendingOperationKind? = null
+
+    /**
+     * v0.1.4: operation generation + resolution claim (ported from
+     * HAUNT v0.1.16). Every operation takes the next generation;
+     * exactly one party — the wrapper on an interrupted path, or
+     * the foreground reconciler — may claim a generation's state
+     * resolution ([claimResolution]). A claimed (or superseded)
+     * generation's late writes and late result delivery are
+     * suppressed: the state has already been resolved by whoever
+     * claimed it, and the caller parked behind clientlib's
+     * non-cooperative suspension may not overwrite it when it
+     * finally wakes.
+     */
+    private val generationCounter = AtomicInteger(0)
+
+    @Volatile
+    private var pendingGeneration: Int = 0
+
+    @Volatile
+    private var resolvedGeneration: Int = 0
+
+    private val resolutionLock = Any()
+
+    /** Claim generation [gen]'s state resolution. True exactly once per gen. */
+    private fun claimResolution(gen: Int): Boolean = synchronized(resolutionLock) {
+        if (resolvedGeneration == gen) false else {
+            resolvedGeneration = gen
+            true
+        }
+    }
+
+    /**
+     * True once generation [gen] has been resolved by someone else
+     * (the reconciler's claim) or superseded by a newer operation:
+     * the operation's late state writes and late success delivery
+     * must be suppressed.
+     */
+    private fun isStaleGeneration(gen: Int): Boolean =
+        resolvedGeneration == gen || pendingGeneration != gen
+
+    /**
+     * v0.1.4: resolve the UI state DIRECTLY for an interrupted
+     * operation of [kind] — the write the reconciler performs
+     * itself, never delegated to the parked caller (see the class
+     * header). Connect has no session to restore to, so it lands
+     * on the Error surface with [errorMessage]; sign/pay restore
+     * from the stored session field (KFC-007).
+     */
+    private fun resolveInterruptedState(kind: PendingOperationKind, errorMessage: String) {
+        when (kind) {
+            PendingOperationKind.CONNECT ->
+                _uiState.value = WalletUiState.Error(errorMessage)
+            PendingOperationKind.SIGN, PendingOperationKind.PAY ->
+                restoreConnectedState()
+        }
+    }
+
     /**
      * Runs one wallet operation under the KFC-008 backstop:
      *
      * - a hard timeout ([TRANSACT_TIMEOUT_MS]): clientlib's transact
      *   carries no timeout, so a wallet that walks away mid-approval
-     *   would hold the caller in Working indefinitely;
-     * - cancellability by [onForeground]: if the operation is
-     *   cancelled there, the await below surfaces it and it is
-     *   converted to [WalletOperationAbandonedException].
+     *   would hold the caller in Working indefinitely. The timeout
+     *   fires on THIS awaiting coroutine, so it bounds even a
+     *   non-cooperatively parked operation; the wrapper claims the
+     *   generation, resolves the state itself, and throws
+     *   [WalletOperationTimeoutException] — the caller still
+     *   receives its ordinary retryable failure (its own state
+     *   writes are then generation-suppressed, see [failIfCurrent]);
+     * - cancellation of the operation (the foreground reconciler's
+     *   hygiene cancel, or this caller being cancelled): converted
+     *   to [WalletOperationAbandonedException] when the REQUEST was
+     *   cancelled — the awaiting coroutine itself is intact, the
+     *   deferred's cancellation is not the caller's. When the
+     *   CALLER was cancelled, the state is still resolved directly
+     *   (the UI is never stranded in Working) and the cancellation
+     *   propagates.
      *
-     * Both failure modes are thrown as ordinary exceptions and land
-     * in the callers' existing failure handling — a stranded
-     * operation always resolves its caller (the bridge promise
-     * included) with a failure the user can retry, never a hang.
+     * v0.1.4: every interrupted path here CLAIMS the generation
+     * before resolving ([claimResolution]) and resolves the state
+     * directly ([resolveInterruptedState]) — resolution never
+     * depends on waking a caller parked behind clientlib's
+     * non-cooperative suspension. If the reconciler already claimed
+     * this generation, the wrapper only delivers the failure; it
+     * writes nothing.
      */
-    private suspend fun <T> runWalletOperation(block: suspend () -> T): T {
+    private suspend fun <T> runWalletOperation(
+        kind: PendingOperationKind,
+        gen: Int,
+        block: suspend () -> T
+    ): T {
         val deferred = operationScope.async { block() }
         pendingOperation = deferred
         pendingOperationSinceMs = SystemClock.elapsedRealtime()
+        pendingKind = kind
+        pendingGeneration = gen
         try {
             return withTimeoutOrNull(TRANSACT_TIMEOUT_MS) { deferred.await() }
                 ?: run {
                     deferred.cancel()
-                    throw WalletOperationTimeoutException()
+                    if (claimResolution(gen)) {
+                        resolveInterruptedState(kind, TIMEOUT_MESSAGE)
+                        throw WalletOperationTimeoutException()
+                    }
+                    // The reconciler already resolved this generation.
+                    throw WalletOperationAbandonedException()
                 }
         } catch (e: CancellationException) {
-            // The deferred was cancelled (foreground reconciliation).
-            // The awaiting coroutine itself is intact — the deferred's
-            // cancellation is not the caller's — so converting it to
-            // an abandonment failure is sound.
+            // Distinguish BEFORE cancelling: was the REQUEST
+            // cancelled underneath this await (reconciliation), or
+            // was this CALLER cancelled (its scope went away)?
+            val requestWasCancelled = deferred.isCancelled
             deferred.cancel()
-            throw WalletOperationAbandonedException()
+            if (claimResolution(gen)) {
+                resolveInterruptedState(kind, ABANDONED_MESSAGE)
+            }
+            if (requestWasCancelled) throw WalletOperationAbandonedException()
+            throw e
         } finally {
             if (pendingOperation === deferred) {
                 pendingOperation = null
                 pendingOperationSinceMs = 0L
+                pendingKind = null
             }
         }
     }
@@ -154,20 +265,41 @@ class WalletManager {
      * (the user left the approval sheet and came back without it
      * resolving — the VR-12 choreography): after a short grace for a
      * just-delivered result to finish landing, the stranded
-     * operation is cancelled. Its caller resolves as an abandonment
-     * failure and restores the UI from session truth — Connected
-     * when the session is live, the error surface (with the client's
-     * retry) otherwise. Nothing is left sitting in Working.
+     * operation is judged abandoned.
+     *
+     * v0.1.4 (HAUNT v0.1.16 shape): the reconciler resolves the UI
+     * state DIRECTLY from session truth — connect → the Error
+     * surface (with the client's retry), sign/pay → restore from
+     * the stored session field — claiming the operation's
+     * generation first, so the parked caller's late resolution and
+     * any zombie writes are suppressed when it eventually wakes
+     * (at the latest, at the 120 s backstop). v0.1.3 cancelled the
+     * Deferred and let resolution flow through the caller's await;
+     * HAUNT's runtime verdict (vr12) proved that never wakes a
+     * caller parked in clientlib's non-cooperative suspension.
+     * The Deferred is still cancelled afterwards — hygiene, never
+     * the mechanism. Nothing is left sitting in Working.
      */
     fun onForeground() {
         val deferred = pendingOperation ?: return
         if (pendingOperationSinceMs == 0L) return
+        val gen = pendingGeneration
+        val kind = pendingKind ?: return
         reconcileScope.launch {
             delay(FOREGROUND_RECONCILE_GRACE_MS)
-            if (pendingOperation === deferred &&
-                _uiState.value is WalletUiState.Working
-            ) {
-                deferred.cancel()
+            // Identity check: act only on the very operation that
+            // was pending at foreground time, and only if it is
+            // still stranded in Working.
+            if (pendingOperation !== deferred || pendingGeneration != gen) return@launch
+            if (_uiState.value !is WalletUiState.Working) return@launch
+            if (claimResolution(gen)) {
+                resolveInterruptedState(kind, ABANDONED_MESSAGE)
+            }
+            deferred.cancel()
+            if (pendingOperation === deferred && pendingGeneration == gen) {
+                pendingOperation = null
+                pendingOperationSinceMs = 0L
+                pendingKind = null
             }
         }
     }
@@ -179,17 +311,28 @@ class WalletManager {
      */
     suspend fun connect(sender: ActivityResultSender): Result<String> =
         withContext(Dispatchers.IO) {
+            val gen = generationCounter.incrementAndGet()
             _uiState.value = WalletUiState.Working
             val result = runCatching {
-                runWalletOperation { walletAdapter.connect(sender) }
+                runWalletOperation(PendingOperationKind.CONNECT, gen) {
+                    walletAdapter.connect(sender)
+                }
             }.getOrElse { e ->
-                return@withContext fail(e.message ?: "Connection failed", e)
+                return@withContext failIfCurrent(gen, e.message ?: "Connection failed", e)
+            }
+            // v0.1.4 zombie suppression: this caller may have been
+            // parked behind clientlib long after the reconciler (or
+            // the wrapper's own interrupted path) already resolved
+            // this generation — then its late result delivers
+            // nothing and writes nothing.
+            if (isStaleGeneration(gen)) {
+                return@withContext Result.failure(WalletOperationAbandonedException())
             }
             when (result) {
                 is TransactionResult.Success -> {
                     val pubkeyBytes = result.authResult.accounts.firstOrNull()?.publicKey
                     if (pubkeyBytes == null) {
-                        fail("Wallet returned no accounts")
+                        failIfCurrent(gen, "Wallet returned no accounts")
                     } else {
                         val base58 = Base58.encode(pubkeyBytes)
                         // KFC-007: capture session truth into the
@@ -201,9 +344,9 @@ class WalletManager {
                     }
                 }
                 is TransactionResult.NoWalletFound ->
-                    fail("No MWA-compatible wallet found on this device")
+                    failIfCurrent(gen, "No MWA-compatible wallet found on this device")
                 is TransactionResult.Failure ->
-                    fail(result.e.message ?: "Wallet connection failed", result.e)
+                    failIfCurrent(gen, result.e.message ?: "Wallet connection failed", result.e)
             }
         }
 
@@ -214,9 +357,10 @@ class WalletManager {
      */
     suspend fun signMessage(sender: ActivityResultSender, message: String): Result<String> =
         withContext(Dispatchers.IO) {
+            val gen = generationCounter.incrementAndGet()
             _uiState.value = WalletUiState.Working
             val result = runCatching {
-                runWalletOperation {
+                runWalletOperation(PendingOperationKind.SIGN, gen) {
                     walletAdapter.transact(sender) { authResult ->
                         val account = authResult.accounts.first().publicKey
                         signMessagesDetached(
@@ -228,6 +372,12 @@ class WalletManager {
             }.getOrElse { e ->
                 restoreConnectedState()
                 return@withContext Result.failure(e)
+            }
+            // v0.1.4 zombie suppression: a caller parked behind
+            // clientlib past its generation's resolution delivers
+            // nothing (see connect).
+            if (isStaleGeneration(gen)) {
+                return@withContext Result.failure(WalletOperationAbandonedException())
             }
             when (result) {
                 is TransactionResult.Success -> {
@@ -259,9 +409,10 @@ class WalletManager {
         sender: ActivityResultSender,
         serializedTransactions: List<ByteArray>
     ): Result<List<String>> = withContext(Dispatchers.IO) {
+        val gen = generationCounter.incrementAndGet()
         _uiState.value = WalletUiState.Working
         val result = runCatching {
-            runWalletOperation {
+            runWalletOperation(PendingOperationKind.PAY, gen) {
                 walletAdapter.transact(sender) {
                     signAndSendTransactions(serializedTransactions.toTypedArray())
                 }
@@ -269,6 +420,12 @@ class WalletManager {
         }.getOrElse { e ->
             restoreConnectedState()
             return@withContext Result.failure(e)
+        }
+        // v0.1.4 zombie suppression: a caller parked behind
+        // clientlib past its generation's resolution delivers
+        // nothing (see connect).
+        if (isStaleGeneration(gen)) {
+            return@withContext Result.failure(WalletOperationAbandonedException())
         }
         when (result) {
             is TransactionResult.Success -> {
@@ -303,6 +460,22 @@ class WalletManager {
     }
 
     /**
+     * v0.1.4: [fail], generation-guarded (ported from HAUNT
+     * v0.1.16) — a connect whose generation has been resolved (the
+     * reconciler or the wrapper's interrupted path already wrote
+     * the state) or superseded by a newer operation returns its
+     * failure WITHOUT writing the Error state over the state that
+     * replaced it.
+     */
+    private fun failIfCurrent(gen: Int, message: String, cause: Throwable? = null): Result<String> {
+        return if (isStaleGeneration(gen)) {
+            Result.failure(cause ?: IllegalStateException(message))
+        } else {
+            fail(message, cause)
+        }
+    }
+
+    /**
      * Restore the post-transact UI state from session truth
      * (KFC-007). The pre-cure form read [publicKeyBase58] back when
      * that getter derived from the UI state — which the transact
@@ -326,6 +499,19 @@ class WalletManager {
          *  IO-side completion lands well inside this window; only a
          *  genuinely stranded operation is still Working after it. */
         const val FOREGROUND_RECONCILE_GRACE_MS: Long = 3_000L
+
+        /** Error-state text when the backstop resolves an operation
+         *  directly (v0.1.4); identical to
+         *  [WalletOperationTimeoutException]'s message, so the state
+         *  and the delivered failure read the same. */
+        private const val TIMEOUT_MESSAGE =
+            "The wallet did not respond — the request timed out. Try again."
+
+        /** Error-state text when an abandoned operation is resolved
+         *  directly (v0.1.4); identical to
+         *  [WalletOperationAbandonedException]'s message. */
+        private const val ABANDONED_MESSAGE =
+            "The wallet request was abandoned before it finished. Try again."
     }
 }
 
