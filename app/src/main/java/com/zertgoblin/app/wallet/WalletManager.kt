@@ -129,6 +129,32 @@ sealed interface WalletUiState {
  * timeout message via [failIfCurrent]). The grading instrument
  * for both elements is the runtime cell (vr12r + vr12s against
  * the real Mock MWA Wallet), not any JVM battery.
+ *
+ * v0.1.7 KFC-008 BRIDGE SETTLEMENT (the estate runtime cell on
+ * the sealed v0.1.6, VR12R_CELL_V016 leg 1 + the bridge
+ * settlement audit, BRIDGE_SETTLEMENT_AUDIT.md): the cell's
+ * retry tap never reached this manager at all — no bridge call,
+ * no attempt line — because the gen-1 JS promise was still
+ * pending when the tap landed. The audit named the cell: since
+ * v0.1.4, interruption resolution is DIRECT for state but
+ * INDIRECT for delivery. The reconciler's claim writes the
+ * state, resets the adapter and cancels the Deferred, but no
+ * path from a claim produces a Result for the awaiting bridge
+ * coroutine, which stays parked behind clientlib's
+ * non-cooperative suspension; the promise settles only at
+ * zombie unwind or at the 120 s backstop — the backstop acts
+ * on the AWAITER and therefore delivers, the reconciler acts
+ * on the Deferred and the state and therefore does not. The
+ * cure gives the claim a delivery: the reconciler's claim now
+ * also fires [onOperationClaimed] (after the claim block,
+ * read-only — it observes the claim, it does not create a
+ * second claimer), and the bridge answers it by settling the
+ * claimed generation's in-flight request immediately with the
+ * identical [ABANDONED_MESSAGE] failure the caller would
+ * eventually have received at zombie time — only its timing
+ * changes, from zombie-scheduled to claim-scheduled. The
+ * generation machinery's state-write suppression is untouched:
+ * only the stale RESULT moves earlier, with the same value.
  */
 class WalletManager {
 
@@ -312,6 +338,25 @@ class WalletManager {
      */
     @Volatile
     private var loopGeneration: Int = 0
+
+    /**
+     * v0.1.7 bridge settlement: the claim notification. Fired
+     * ONLY at the claim site that does not already deliver
+     * through the awaiter — the foreground reconciler's claim in
+     * [onForeground], after the claim block has run (state
+     * written, adapter reset, loop armed). The wrapper's
+     * interrupted exits claim too, but they throw through the
+     * awaiting caller in the same call stack, so their delivery
+     * is already prompt and needs no hook. The hook observes the
+     * claim and carries the claimed generation; it never writes
+     * state and never claims anything itself. The consumer is
+     * the wallet bridge (one per Activity; the manager is
+     * app-scoped), which registers at construction and clears
+     * the hook at Activity destruction — see
+     * [ZertGoblinWalletBridge] and BRIDGE_SETTLEMENT_AUDIT.md §4.
+     */
+    @Volatile
+    var onOperationClaimed: ((gen: Int) -> Unit)? = null
 
     /** Claim generation [gen]'s state resolution. True exactly once per gen. */
     private fun claimResolution(gen: Int): Boolean = synchronized(resolutionLock) {
@@ -515,6 +560,12 @@ class WalletManager {
      * the snapshot is consumed only on the path that proceeds.
      * The claim here also raises [lastRequestInterrupted],
      * arming the retry's refire loop (Element A).
+     *
+     * v0.1.7: the claim additionally fires [onOperationClaimed]
+     * so the bridge can settle the claimed generation's JS
+     * promise at claim time — before v0.1.7 this claim resolved
+     * the state directly but left the delivery coupled to the
+     * parked caller (BRIDGE_SETTLEMENT_AUDIT.md, cell (c)).
      */
     fun onForeground() {
         val deferred = pendingOperation ?: return
@@ -546,6 +597,17 @@ class WalletManager {
                 // interruption — the next connect is a retry and
                 // runs the refire loop (Element A).
                 lastRequestInterrupted = true
+                // v0.1.7: give the claim a DELIVERY, symmetric
+                // with the direct state resolution above. This
+                // claim produces no Result for the caller parked
+                // behind clientlib's non-cooperative suspension
+                // (its failure would arrive only at zombie unwind
+                // or the 120 s backstop), so the bridge is told
+                // now and settles the claimed generation's
+                // in-flight JS promise at claim time with the
+                // identical abandoned failure (see the class
+                // header and BRIDGE_SETTLEMENT_AUDIT.md §2(c)).
+                onOperationClaimed?.invoke(gen)
             }
             deferred.cancel()
             if (pendingOperation === deferred && pendingGeneration == gen) {
@@ -571,10 +633,21 @@ class WalletManager {
      * Connect to a wallet. Launches the MWA association intent via
      * [sender] (the ActivityResultSender created once by MainActivity
      * in onCreate). Returns the wallet's Base58 public key on success.
+     *
+     * [onOperationStarted] (v0.1.7, bridge settlement) is invoked
+     * with this operation's generation the moment it is assigned —
+     * before the operation can become pending, hence before any
+     * claim can target it — so the bridge can bind its in-flight
+     * requestId to the generation a later claim notification must
+     * match. Null for non-bridge callers.
      */
-    suspend fun connect(sender: ActivityResultSender): Result<String> =
+    suspend fun connect(
+        sender: ActivityResultSender,
+        onOperationStarted: ((gen: Int) -> Unit)? = null
+    ): Result<String> =
         withContext(Dispatchers.IO) {
             val gen = generationCounter.incrementAndGet()
+            onOperationStarted?.invoke(gen)
             try {
                 // v0.1.6 Element A: the refire loop arms ONLY on a
                 // connect that follows an interruption resolution —
@@ -798,9 +871,15 @@ class WalletManager {
      * wallet-session proof and .skr label link both ride this).
      * Returns the Base58 signature.
      */
-    suspend fun signMessage(sender: ActivityResultSender, message: String): Result<String> =
+    suspend fun signMessage(
+        sender: ActivityResultSender,
+        message: String,
+        onOperationStarted: ((gen: Int) -> Unit)? = null
+    ): Result<String> =
         withContext(Dispatchers.IO) {
             val gen = generationCounter.incrementAndGet()
+            // v0.1.7: bridge settlement binding (see [connect]).
+            onOperationStarted?.invoke(gen)
             // v0.1.5: instance affinity, as in connect.
             val adapter = walletAdapter
             _uiState.value = WalletUiState.Working
@@ -852,9 +931,12 @@ class WalletManager {
      */
     suspend fun signAndSendTransactions(
         sender: ActivityResultSender,
-        serializedTransactions: List<ByteArray>
+        serializedTransactions: List<ByteArray>,
+        onOperationStarted: ((gen: Int) -> Unit)? = null
     ): Result<List<String>> = withContext(Dispatchers.IO) {
         val gen = generationCounter.incrementAndGet()
+        // v0.1.7: bridge settlement binding (see [connect]).
+        onOperationStarted?.invoke(gen)
         // v0.1.5: instance affinity, as in connect.
         val adapter = walletAdapter
         _uiState.value = WalletUiState.Working
@@ -990,8 +1072,13 @@ class WalletManager {
 
         /** Error-state text when an abandoned operation is resolved
          *  directly (v0.1.4); identical to
-         *  [WalletOperationAbandonedException]'s message. */
-        private const val ABANDONED_MESSAGE =
+         *  [WalletOperationAbandonedException]'s message.
+         *  v0.1.7: public within the app — it is also the value the
+         *  bridge's claim-delivery posts for the claimed
+         *  generation's in-flight request (the identical failure
+         *  the caller receives today at zombie time, delivered at
+         *  claim time instead). The wording is unchanged. */
+        const val ABANDONED_MESSAGE =
             "The wallet request was abandoned before it finished. Try again."
     }
 }

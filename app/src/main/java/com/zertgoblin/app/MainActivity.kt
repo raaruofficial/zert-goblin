@@ -38,6 +38,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private var errorPageShown = false
 
+    /**
+     * The wallet bridge attached to [webView] (v0.1.7: held so
+     * onDestroy can clear its claim hook on the app-scoped
+     * WalletManager — bridges are per-Activity, the manager is
+     * not; see ZertGoblinWalletBridge.release).
+     */
+    private var walletBridge: ZertGoblinWalletBridge? = null
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -111,6 +119,7 @@ class MainActivity : ComponentActivity() {
                     sender = sender,
                     evaluateJs = { js -> runOnUiThread { evaluateJavascript(js, null) } }
                 )
+                walletBridge = bridge
                 addJavascriptInterface(bridge, GameConfig.BRIDGE_NATIVE_NAME)
 
                 // Define window.ZertGoblinWallet before any page script runs.
@@ -220,6 +229,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // v0.1.7: clear this bridge's claim hook on the app-scoped
+        // WalletManager before the WebView dies — a claim delivered
+        // through a stale hook would post into a destroyed WebView
+        // (a harmless no-op against a page that no longer holds the
+        // promise, but the invariant stays honest).
+        walletBridge?.release()
+        walletBridge = null
         if (::webView.isInitialized) webView.destroy()
         super.onDestroy()
     }
