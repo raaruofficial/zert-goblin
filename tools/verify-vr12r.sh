@@ -162,6 +162,26 @@
 #       consumption-prong failures are DISTINCT steps
 #       (reconciler-claim vs completion-consumption/completion),
 #       never blurred.
+#
+# Driver r5 (this revision) — INSTRUMENT FIX. The first r4 run
+# (CI 41047924177, against v0.1.7) graded BOTH legs on an empty
+# marker set: `adb logcat -v epoch` right-pads the epoch field
+# with leading spaces, and r4's line regex anchored the epoch at
+# column 0, so no stream line ever parsed. The run's FAILs
+# (resolution-delivery; completion-consumption 0/0/0) are
+# instrument artifacts — the filed stream, re-parsed offline
+# with the corrected pattern, shows the leg-1 claim-delivery at
+# the grace and the leg-2 consumption signature complete (see
+# VR12R_CELL_V017.md, which records the run's re-grade). r4's
+# offline helper validation used a synthetic stream whose
+# converter emitted unpadded epochs, which is why it passed:
+# r5's helpers were re-validated against the REAL padded stream
+# from CI 41047924177. Changes vs r4: the line regex tolerates
+# leading whitespace in all three marker helpers (mq,
+# zombie_death_epoch, consumption_after); the driver logs its
+# own t_abandon / t_resume epochs so post-hoc offset recovery
+# does not depend on lane-log seconds. No grading-semantics
+# change.
 set -u
 
 PKG="com.zertgoblin.app"
@@ -367,7 +387,7 @@ import re, sys
 path, mode, pattern, after = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 pid = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
 rx = re.compile(pattern)
-line_rx = re.compile(r"^(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
+line_rx = re.compile(r"^\s*(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
 hits = []
 try:
     fh = open(path, encoding="utf-8", errors="ignore")
@@ -411,7 +431,7 @@ zombie_death_epoch() {
 import re, sys
 path, after, pid = sys.argv[1], float(sys.argv[2]), sys.argv[3]
 appside = len(sys.argv) > 4 and sys.argv[4] == "appside"
-line_rx = re.compile(r"^(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
+line_rx = re.compile(r"^\s*(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
 decline = None
 receipts = []
 disconnects = []
@@ -453,7 +473,7 @@ consumption_after() {
   python3 - "$STREAM" "$1" "$2" <<'PY'
 import re, sys
 path, after, pid = sys.argv[1], float(sys.argv[2]), sys.argv[3]
-line_rx = re.compile(r"^(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
+line_rx = re.compile(r"^\s*(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
 authz = 0
 receipt = None  # (epoch, tid)
 close = None
@@ -837,6 +857,7 @@ cell_vr12r() {
   # earlier to absorb any host/device clock skew.
   local t_resume; t_resume="$(host_now)"
   local t_resume_anchor; t_resume_anchor="$(python3 -c "print(f'{$t_resume - 2:.3f}')")"
+  log "vr12r: epochs — gen1=${gen1:-none} t_abandon=$t_abandon t_resume=$t_resume"
   sleep 2
   local t_return; t_return="$(date +%s)"
   snap "shot-returned.png"
@@ -1127,6 +1148,7 @@ cell_vr12s() {
   local t_resume_f; t_resume_f="$(host_now)"
   local t_resume_anchor; t_resume_anchor="$(python3 -c "print(f'{$t_resume_f - 2:.3f}')")"
   local t_resume; t_resume="$(date +%s)"
+  log "vr12s: epochs — t0=$t0 spanning=${span_scen:-none} t_resume=$t_resume_f"
   # r4 GRACE WINDOW — WIRE-GRADED, FULL WINDOW, NO EARLY BREAK
   # (r3's poll broke on its first DOM read — a reading that is
   # temporally incapable of being a claim, since the reconciler
@@ -1261,7 +1283,7 @@ fi
 {
   echo "cell=$cell"
   [ -n "$fail_step" ] && echo "fail_step=$fail_step"
-  echo "driver=r4"
+  echo "driver=r5"
   echo "resolution_s=$resolution_s"
   echo "resolution_form=$resolution_form"
   echo "resolution_path=$resolution_path"

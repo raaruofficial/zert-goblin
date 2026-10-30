@@ -138,6 +138,18 @@ signature, zombie-death epoch, and scenario epochs reproduce
 that run's hand-read wire facts exactly, and the vr12s grace
 query returns no false wire-break on its window).
 
+Driver r5 (instrument fix, same day): the first r4 run (CI
+41047924177) graded both legs on an empty marker set —
+`adb logcat -v epoch` right-pads the epoch field with leading
+spaces and r4's line regex anchored at column 0, so nothing
+parsed; that run's filed FAILs are instrument artifacts (its
+stream, re-parsed, shows the leg-1 claim-delivery at the grace
+and the leg-2 consumption signature complete — full re-grade in
+`VR12R_CELL_V017.md`). r5 tolerates the padding in all three
+helpers, logs the driver's own event epochs, and was validated
+against the REAL padded stream from that run before
+re-dispatch. No grading-semantics change.
+
 ## Observation surfaces — and their limits
 
 - **Wire markers (primary since r4).** A continuous
