@@ -66,16 +66,56 @@ sealed interface WalletUiState {
  * late resolution nor a zombie operation's late writes/delivery
  * can overwrite it; the Deferred cancellation remains, as hygiene
  * only. The 120 s backstop is unchanged.
+ *
+ * v0.1.5 KFC-008 THIRD ELEMENT (the retry layer): HAUNT's pre-fire
+ * check on its sealed v0.1.16 found a third layer beneath vr12 —
+ * after an abandonment resolves and the user taps TRY AGAIN in the
+ * same process, the retry's wallet association never binds: the
+ * retry runs on the SAME long-lived adapter instance whose only
+ * established MWA scenario is the abandoned (zombie) one, so its
+ * result is generation-suppressed and the new association dies
+ * (30+ s ECONNREFUSED); only a fresh process recovers. Zert's
+ * v0.1.4 instance carried the identical precondition (one
+ * immutable adapter, one construction site). The adapter is now
+ * recreatable (see [resetWalletAdapter]): every interruption
+ * resolution — the reconciler's claim, the backstop's claim, the
+ * caller-abandonment claim — discards the interrupted operation's
+ * adapter instance WITHOUT disconnect (the zombie scenario and
+ * its local association server die with it) and installs a fresh
+ * one, so an in-process retry associates against a clean
+ * instance. Session continuity rides the manager-held
+ * [sessionAuthToken] field, never the discarded instance (HAUNT's
+ * v0.1.17 reset shape, implemented from main's specification —
+ * HAUNT's own strike had not landed when this one was cut).
  */
 class WalletManager {
 
-    private val walletAdapter = MobileWalletAdapter(
-        connectionIdentity = ConnectionIdentity(
-            identityUri = Uri.parse("https://raaruofficial.github.io/zert-goblin/"),
-            iconUri = Uri.parse("favicon.ico"), // resolves against identityUri
-            identityName = "Zert Goblin"
+    /**
+     * v0.1.5: the adapter instance lives in a recreatable holder.
+     * Pre-v0.1.5 this was a single immutable `val` constructed once
+     * for the process lifetime — the structural precondition of the
+     * KFC-008 retry-layer defect (see the class header): an
+     * abandoned operation's MWA scenario stayed the only
+     * established one in the instance, and an in-process retry
+     * could never bind a new association. Interruption resolutions
+     * now discard the instance and install a fresh one
+     * ([resetWalletAdapter]). The ConnectionIdentity is identical
+     * for every instance — same parameters, rebuilt by the factory.
+     * @Volatile: written by whichever thread resolves an
+     * interruption, read by operation threads.
+     */
+    @Volatile
+    private var walletAdapter: MobileWalletAdapter = createWalletAdapter()
+
+    /** Build a fresh adapter with this shell's ConnectionIdentity. */
+    private fun createWalletAdapter(): MobileWalletAdapter =
+        MobileWalletAdapter(
+            connectionIdentity = ConnectionIdentity(
+                identityUri = Uri.parse("https://raaruofficial.github.io/zert-goblin/"),
+                iconUri = Uri.parse("favicon.ico"), // resolves against identityUri
+                identityName = "Zert Goblin"
+            )
         )
-    )
 
     private val _uiState = MutableStateFlow<WalletUiState>(WalletUiState.Disconnected)
     val uiState: StateFlow<WalletUiState> = _uiState.asStateFlow()
@@ -91,6 +131,22 @@ class WalletManager {
     private var sessionPubkey: String? = null
 
     /**
+     * Session truth, second half (v0.1.5): the MWA auth token
+     * captured from the serving adapter instance at successful
+     * connect (and mirrored by the [persistedAuthToken] setter, so
+     * an imported token is captured too). An adapter reset
+     * ([resetWalletAdapter]) restores the fresh instance's token
+     * from THIS field and never reads the discarded instance: for a
+     * sign/pay interruption this is the live session's token, so
+     * the session survives the swap; for a connect interruption in
+     * the abandonment case it is null, because no connect ever
+     * completed and no capture ever happened. Cleared at disconnect
+     * with [sessionPubkey].
+     */
+    @Volatile
+    private var sessionAuthToken: String? = null
+
+    /**
      * The connected wallet's Base58 pubkey, from session truth —
      * never derived from the (presentation-only) UI state.
      */
@@ -100,11 +156,21 @@ class WalletManager {
     val isConnected: Boolean
         get() = _uiState.value is WalletUiState.Connected
 
-    /** Get/set the MWA auth token so it can be persisted across restarts. */
+    /**
+     * Get/set the MWA auth token so it can be persisted across
+     * restarts. v0.1.5: both directions operate on the CURRENT
+     * adapter instance (a reset may have replaced it since the
+     * token was captured), and the setter also mirrors the value
+     * into [sessionAuthToken], keeping the captured-token field
+     * consistent with the instance: a token imported here survives
+     * a later adapter reset exactly as a connect-captured one does,
+     * and a get after a reset returns the current instance's token.
+     */
     var persistedAuthToken: String?
         get() = walletAdapter.authToken
         set(value) {
             walletAdapter.authToken = value
+            sessionAuthToken = value
         }
 
     // -- KFC-008 backstop machinery ------------------------------------
@@ -189,6 +255,36 @@ class WalletManager {
     }
 
     /**
+     * v0.1.5 KFC-008 third element: discard the interrupted
+     * operation's adapter instance and install a fresh one. Called
+     * from exactly the interruption-resolution points — wherever a
+     * generation is claimed by anyone other than normal completion
+     * (the reconciler's claim in [onForeground], the backstop's
+     * claim and the caller-abandonment claim in
+     * [runWalletOperation]) — and from nowhere else, so the reset
+     * fires exactly once per claimed generation: whoever claims,
+     * resets.
+     *
+     * The discarded instance is dropped WITHOUT calling disconnect
+     * on it: its MWA scenario is the zombie the user just abandoned
+     * — politely closing it is neither required nor desired; the
+     * scenario and its local association server die with the
+     * instance. The fresh instance's auth token is set from the
+     * manager-held [sessionAuthToken] ONLY: after a sign/pay
+     * interruption that is the live session's captured token, so
+     * the session survives the swap (KFC-007 semantics); after a
+     * connect interruption nothing is imported from whatever the
+     * zombie instance may silently hold — in the abandonment case
+     * the field is null, because no connect ever completed. Normal
+     * completions never reach this function.
+     */
+    private fun resetWalletAdapter() {
+        val fresh = createWalletAdapter()
+        fresh.authToken = sessionAuthToken
+        walletAdapter = fresh
+    }
+
+    /**
      * Runs one wallet operation under the KFC-008 backstop:
      *
      * - a hard timeout ([TRANSACT_TIMEOUT_MS]): clientlib's transact
@@ -216,6 +312,11 @@ class WalletManager {
      * non-cooperative suspension. If the reconciler already claimed
      * this generation, the wrapper only delivers the failure; it
      * writes nothing.
+     *
+     * v0.1.5: a successful claim here also resets the wallet
+     * adapter ([resetWalletAdapter]). The claim is the exact point
+     * where this operation's association becomes a zombie; the
+     * retry layer must not inherit it.
      */
     private suspend fun <T> runWalletOperation(
         kind: PendingOperationKind,
@@ -233,6 +334,7 @@ class WalletManager {
                     deferred.cancel()
                     if (claimResolution(gen)) {
                         resolveInterruptedState(kind, TIMEOUT_MESSAGE)
+                        resetWalletAdapter()
                         throw WalletOperationTimeoutException()
                     }
                     // The reconciler already resolved this generation.
@@ -246,6 +348,7 @@ class WalletManager {
             deferred.cancel()
             if (claimResolution(gen)) {
                 resolveInterruptedState(kind, ABANDONED_MESSAGE)
+                resetWalletAdapter()
             }
             if (requestWasCancelled) throw WalletOperationAbandonedException()
             throw e
@@ -279,6 +382,13 @@ class WalletManager {
      * caller parked in clientlib's non-cooperative suspension.
      * The Deferred is still cancelled afterwards — hygiene, never
      * the mechanism. Nothing is left sitting in Working.
+     *
+     * v0.1.5: the claim also resets the wallet adapter
+     * ([resetWalletAdapter]), so the user's in-process retry
+     * (the Error surface's TRY AGAIN) associates against a fresh
+     * instance — not the abandoned operation's zombie scenario,
+     * which HAUNT's pre-fire check showed can never bind a retry
+     * (the KFC-008 retry layer).
      */
     fun onForeground() {
         val deferred = pendingOperation ?: return
@@ -294,6 +404,7 @@ class WalletManager {
             if (_uiState.value !is WalletUiState.Working) return@launch
             if (claimResolution(gen)) {
                 resolveInterruptedState(kind, ABANDONED_MESSAGE)
+                resetWalletAdapter()
             }
             deferred.cancel()
             if (pendingOperation === deferred && pendingGeneration == gen) {
@@ -312,10 +423,15 @@ class WalletManager {
     suspend fun connect(sender: ActivityResultSender): Result<String> =
         withContext(Dispatchers.IO) {
             val gen = generationCounter.incrementAndGet()
+            // v0.1.5: an operation runs against the adapter instance
+            // current at ITS start. An interruption reset replaces
+            // the holder for the NEXT operation; it never swaps the
+            // instance under a live (or zombie-parked) one.
+            val adapter = walletAdapter
             _uiState.value = WalletUiState.Working
             val result = runCatching {
                 runWalletOperation(PendingOperationKind.CONNECT, gen) {
-                    walletAdapter.connect(sender)
+                    adapter.connect(sender)
                 }
             }.getOrElse { e ->
                 return@withContext failIfCurrent(gen, e.message ?: "Connection failed", e)
@@ -339,6 +455,12 @@ class WalletManager {
                         // stored field at connect time. Every later
                         // restore reads this field, never the UI state.
                         sessionPubkey = base58
+                        // v0.1.5: capture the auth token from the
+                        // serving instance into its stored field at
+                        // the same moment. An adapter reset restores
+                        // the session from this field — the discarded
+                        // instance is never read.
+                        sessionAuthToken = adapter.authToken
                         _uiState.value = WalletUiState.Connected(base58)
                         Result.success(base58)
                     }
@@ -358,10 +480,12 @@ class WalletManager {
     suspend fun signMessage(sender: ActivityResultSender, message: String): Result<String> =
         withContext(Dispatchers.IO) {
             val gen = generationCounter.incrementAndGet()
+            // v0.1.5: instance affinity, as in connect.
+            val adapter = walletAdapter
             _uiState.value = WalletUiState.Working
             val result = runCatching {
                 runWalletOperation(PendingOperationKind.SIGN, gen) {
-                    walletAdapter.transact(sender) { authResult ->
+                    adapter.transact(sender) { authResult ->
                         val account = authResult.accounts.first().publicKey
                         signMessagesDetached(
                             arrayOf(message.toByteArray(Charsets.UTF_8)),
@@ -410,10 +534,12 @@ class WalletManager {
         serializedTransactions: List<ByteArray>
     ): Result<List<String>> = withContext(Dispatchers.IO) {
         val gen = generationCounter.incrementAndGet()
+        // v0.1.5: instance affinity, as in connect.
+        val adapter = walletAdapter
         _uiState.value = WalletUiState.Working
         val result = runCatching {
             runWalletOperation(PendingOperationKind.PAY, gen) {
-                walletAdapter.transact(sender) {
+                adapter.transact(sender) {
                     signAndSendTransactions(serializedTransactions.toTypedArray())
                 }
             }
@@ -451,6 +577,14 @@ class WalletManager {
         runCatching { walletAdapter.disconnect(sender) }
         // KFC-007: session truth dies with the session.
         sessionPubkey = null
+        // v0.1.5: the captured token is the other half of session
+        // truth; it dies here too. The adapter instance is NOT
+        // recreated on this path: disconnect closes its scenario
+        // politely through the adapter itself, so there is no
+        // zombie to discard — resets belong to interruption
+        // resolutions only, and recreating here would change
+        // nothing observable beyond instance identity.
+        sessionAuthToken = null
         _uiState.value = WalletUiState.Disconnected
     }
 
