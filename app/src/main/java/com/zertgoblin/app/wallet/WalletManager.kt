@@ -2,6 +2,7 @@ package com.zertgoblin.app.wallet
 
 import android.net.Uri
 import android.os.SystemClock
+import android.util.Log
 import com.solana.mobilewalletadapter.clientlib.ActivityResultSender
 import com.solana.mobilewalletadapter.clientlib.ConnectionIdentity
 import com.solana.mobilewalletadapter.clientlib.MobileWalletAdapter
@@ -13,6 +14,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -87,6 +89,46 @@ sealed interface WalletUiState {
  * [sessionAuthToken] field, never the discarded instance (HAUNT's
  * v0.1.17 reset shape, implemented from main's specification —
  * HAUNT's own strike had not landed when this one was cut).
+ *
+ * v0.1.6 KFC-008 SHAPE 2 + RECONCILER SCOPING (the estate runtime
+ * cell on the sealed v0.1.5, VR12R_CELL_V015 — vr12r FAIL run 3,
+ * vr12s FAIL): two stacked layers beneath the corrected
+ * resolution. (A) THE RETRY: after an interruption resolution, a
+ * TRY AGAIN connect's single association intent is swallowed by
+ * the wallet's single-task intent handler while the zombie sheet
+ * is still in flight (in the failing run the zombie died ~59 s
+ * after the retry tap) — no clientlib-side state reaches that
+ * layer: not v0.1.4's resolution, not v0.1.5's adapter reset
+ * (HAUNT's v0.1.17 runtime verdict disproved the reset theory on
+ * the identical shape). What the app CAN do is detect the doomed
+ * association and refire: a connect that follows an interruption
+ * runs the refire loop (see [runConnectAttempts]) — up to 3
+ * attempts in 35 s slots, where a SLOW outcome (>25 s) is the
+ * swallow signature and refires, and a FAST definitive answer
+ * ends the loop. (B) THE RECONCILER'S SCOPE: the v0.1.4/v0.1.5
+ * reconciler armed against whatever operation was pending at
+ * FOREGROUND time, so a legitimate foreground-started request
+ * spanning a later resume was claimed mid-flight (vr12s: claimed
+ * at the grace boundary while its authorize sheet sat
+ * unanswered; HAUNT's v0.1.18 run showed the same mechanism
+ * claiming the retry itself). The reconciler now resolves ONLY
+ * the generation snapshotted at background time
+ * ([onAppBackgrounded], wired from MainActivity.onStop), and the
+ * refire loop's generation is exempt outright — the exemption
+ * wins even over the snapshot. Both shapes are ported from
+ * HAUNT's landed code: v0.1.18 (commit `635bfc5` + compile fixes
+ * `e1cf34c`/`61380bf`) as hardened by v0.1.19 (commit `2ff0500`),
+ * read firsthand in `~/workspace/haunt-lane/repo`. Zert
+ * adaptations, each forced by a real difference in this shell:
+ * the PAY operation kind rides alongside CONNECT/SIGN; the loop
+ * outcome carries the serving adapter instance so the auth token
+ * is captured from the instance that actually served (v0.1.5
+ * token discipline); attempt timing reads SystemClock (this
+ * shell's monotonic source) instead of wall-clock; Zert's error
+ * vocabulary is kept (loop exhaustion resolves with the existing
+ * timeout message via [failIfCurrent]). The grading instrument
+ * for both elements is the runtime cell (vr12r + vr12s against
+ * the real Mock MWA Wallet), not any JVM battery.
  */
 class WalletManager {
 
@@ -145,6 +187,26 @@ class WalletManager {
      */
     @Volatile
     private var sessionAuthToken: String? = null
+
+    /**
+     * v0.1.6 Element A arming flag (HAUNT v0.1.17/v0.1.18's shape):
+     * raised at exactly the interruption-resolution points — the
+     * foreground reconciler's claim in [onForeground], and the
+     * backstop's interrupted exit and the request-cancelled exit
+     * in [runWalletOperation] — i.e. whenever an operation's
+     * resolution was claimed BY an interruption rather than
+     * reached by normal completion or an ordinary failure. The
+     * next [connect] reads and consumes it at entry: raised → that
+     * connect follows an interruption and runs the refire loop
+     * ([runConnectAttempts]); clear → it is an ordinary connect (a
+     * first-ever connect, or one after a clean disconnect or
+     * failure) and never loops. A caller-cancelled claim does NOT
+     * raise it (HAUNT parity): the caller's own scope dying says
+     * nothing about the wallet's intent handling, and there is no
+     * live caller to retry.
+     */
+    @Volatile
+    private var lastRequestInterrupted: Boolean = false
 
     /**
      * The connected wallet's Base58 pubkey, from session truth —
@@ -219,6 +281,37 @@ class WalletManager {
     private var resolvedGeneration: Int = 0
 
     private val resolutionLock = Any()
+
+    /**
+     * v0.1.6 Element B (HAUNT v0.1.19): the generation pending when
+     * the app last backgrounded, snapshotted by [onAppBackgrounded]
+     * (0 = none was pending). The foreground reconciler may
+     * resolve ONLY this generation: it is the one the wallet may
+     * have abandoned while the app was away. A generation started
+     * in the foreground — after the return, or never pending at a
+     * backgrounding — is not a reconciliation candidate, however
+     * long it legitimately runs (MWA association alone can take
+     * ~30 s; the vr12s cell failed v0.1.5 for claiming exactly
+     * such a spanning connect).
+     */
+    @Volatile
+    private var backgroundedGeneration: Int = 0
+
+    /**
+     * v0.1.6 Element B exemption (HAUNT v0.1.19): the generation
+     * currently running the post-interruption refire loop (set by
+     * [connect] at loop entry, cleared when that connect returns).
+     * The reconciler NEVER resolves it — not even when it is the
+     * backgrounded snapshot: the loop's attempts background the
+     * app on every wallet sheet by design and legitimately run
+     * for tens of seconds after each return, so no grace window
+     * can distinguish them from an abandonment; the loop's own
+     * bounds (3 × 35 s inside the 120 s backstop) resolve it
+     * instead. The exemption wins over the snapshot under all
+     * circumstances.
+     */
+    @Volatile
+    private var loopGeneration: Int = 0
 
     /** Claim generation [gen]'s state resolution. True exactly once per gen. */
     private fun claimResolution(gen: Int): Boolean = synchronized(resolutionLock) {
@@ -317,6 +410,12 @@ class WalletManager {
      * adapter ([resetWalletAdapter]). The claim is the exact point
      * where this operation's association becomes a zombie; the
      * retry layer must not inherit it.
+     *
+     * v0.1.6: the interrupted exits here also raise
+     * [lastRequestInterrupted], arming the next connect's refire
+     * loop (Element A) — the timeout exit unconditionally, the
+     * cancellation exit when the request was cancelled underneath
+     * the await; the caller-cancelled exit does not raise it.
      */
     private suspend fun <T> runWalletOperation(
         kind: PendingOperationKind,
@@ -332,6 +431,12 @@ class WalletManager {
             return withTimeoutOrNull(TRANSACT_TIMEOUT_MS) { deferred.await() }
                 ?: run {
                     deferred.cancel()
+                    // v0.1.6: the backstop's interrupted exit arms
+                    // the next connect's refire loop — this
+                    // operation was interrupted whoever claimed its
+                    // resolution (here, or the reconciler just
+                    // before the timeout fired).
+                    lastRequestInterrupted = true
                     if (claimResolution(gen)) {
                         resolveInterruptedState(kind, TIMEOUT_MESSAGE)
                         resetWalletAdapter()
@@ -346,6 +451,12 @@ class WalletManager {
             // was this CALLER cancelled (its scope went away)?
             val requestWasCancelled = deferred.isCancelled
             deferred.cancel()
+            // v0.1.6: a request cancelled underneath this await (the
+            // reconciler's hygiene cancel) is an interruption
+            // resolution — arm the next connect's refire loop. A
+            // caller-cancelled await does not arm it (see
+            // [lastRequestInterrupted]).
+            if (requestWasCancelled) lastRequestInterrupted = true
             if (claimResolution(gen)) {
                 resolveInterruptedState(kind, ABANDONED_MESSAGE)
                 resetWalletAdapter()
@@ -389,12 +500,38 @@ class WalletManager {
      * instance — not the abandoned operation's zombie scenario,
      * which HAUNT's pre-fire check showed can never bind a retry
      * (the KFC-008 retry layer).
+     *
+     * v0.1.6 Element B (HAUNT v0.1.19) — SCOPING + ARMING: this
+     * reconciler may resolve ONLY the generation snapshotted at
+     * background time ([backgroundedGeneration], taken by
+     * [onAppBackgrounded] from MainActivity.onStop), and the
+     * refire loop's generation ([loopGeneration]) is exempt
+     * outright — the exemption is checked first and wins even
+     * over the snapshot. A pending generation different from the
+     * snapshot (started in the foreground, or started after
+     * backgrounding) is left untouched under all circumstances;
+     * the foreground-time identity check inside the grace launch
+     * remains as a second guard, not the scoping mechanism, and
+     * the snapshot is consumed only on the path that proceeds.
+     * The claim here also raises [lastRequestInterrupted],
+     * arming the retry's refire loop (Element A).
      */
     fun onForeground() {
         val deferred = pendingOperation ?: return
         if (pendingOperationSinceMs == 0L) return
         val gen = pendingGeneration
         val kind = pendingKind ?: return
+        // v0.1.6 Element B: the refire loop's generation is exempt
+        // outright (its own bounds resolve it) — checked first, so
+        // the exemption wins even when the loop generation is the
+        // backgrounded snapshot itself.
+        if (gen == loopGeneration) return
+        // v0.1.6 Element B: only the generation pending when the
+        // app backgrounded can have been abandoned by the wallet.
+        // Anything else started in the foreground and is running
+        // with the user watching — leave it alone.
+        if (gen != backgroundedGeneration) return
+        backgroundedGeneration = 0
         reconcileScope.launch {
             delay(FOREGROUND_RECONCILE_GRACE_MS)
             // Identity check: act only on the very operation that
@@ -405,6 +542,10 @@ class WalletManager {
             if (claimResolution(gen)) {
                 resolveInterruptedState(kind, ABANDONED_MESSAGE)
                 resetWalletAdapter()
+                // v0.1.6: this resolution was claimed by an
+                // interruption — the next connect is a retry and
+                // runs the refire loop (Element A).
+                lastRequestInterrupted = true
             }
             deferred.cancel()
             if (pendingOperation === deferred && pendingGeneration == gen) {
@@ -416,6 +557,17 @@ class WalletManager {
     }
 
     /**
+     * v0.1.6 Element B (HAUNT v0.1.19): snapshot the pending
+     * generation at background time — called from
+     * MainActivity.onStop. The foreground reconciler may resolve
+     * ONLY the generation this snapshot holds (see
+     * [backgroundedGeneration] and [onForeground]).
+     */
+    fun onAppBackgrounded() {
+        backgroundedGeneration = if (pendingOperation != null) pendingGeneration else 0
+    }
+
+    /**
      * Connect to a wallet. Launches the MWA association intent via
      * [sender] (the ActivityResultSender created once by MainActivity
      * in onCreate). Returns the wallet's Base58 public key on success.
@@ -423,54 +575,223 @@ class WalletManager {
     suspend fun connect(sender: ActivityResultSender): Result<String> =
         withContext(Dispatchers.IO) {
             val gen = generationCounter.incrementAndGet()
-            // v0.1.5: an operation runs against the adapter instance
-            // current at ITS start. An interruption reset replaces
-            // the holder for the NEXT operation; it never swaps the
-            // instance under a live (or zombie-parked) one.
-            val adapter = walletAdapter
-            _uiState.value = WalletUiState.Working
-            val result = runCatching {
-                runWalletOperation(PendingOperationKind.CONNECT, gen) {
-                    adapter.connect(sender)
+            try {
+                // v0.1.6 Element A: the refire loop arms ONLY on a
+                // connect that follows an interruption resolution —
+                // [lastRequestInterrupted] is raised at exactly those
+                // resolution points and consumed here, at entry, so
+                // the loop decision is made once. A first-ever
+                // connect, and a connect after a clean disconnect or
+                // an ordinary failure, never loop.
+                val followInterruption = lastRequestInterrupted
+                if (followInterruption) {
+                    lastRequestInterrupted = false
+                    // v0.1.5 hygiene parity with HAUNT v0.1.17: the
+                    // retry discards once more before transacting,
+                    // beyond the claim-site reset that already ran.
+                    resetWalletAdapter()
+                    // Element B exemption: the reconciler must never
+                    // resolve this generation — its own bounds do.
+                    loopGeneration = gen
                 }
-            }.getOrElse { e ->
-                return@withContext failIfCurrent(gen, e.message ?: "Connection failed", e)
-            }
-            // v0.1.4 zombie suppression: this caller may have been
-            // parked behind clientlib long after the reconciler (or
-            // the wrapper's own interrupted path) already resolved
-            // this generation — then its late result delivers
-            // nothing and writes nothing.
-            if (isStaleGeneration(gen)) {
-                return@withContext Result.failure(WalletOperationAbandonedException())
-            }
-            when (result) {
-                is TransactionResult.Success -> {
-                    val pubkeyBytes = result.authResult.accounts.firstOrNull()?.publicKey
-                    if (pubkeyBytes == null) {
-                        failIfCurrent(gen, "Wallet returned no accounts")
-                    } else {
-                        val base58 = Base58.encode(pubkeyBytes)
-                        // KFC-007: capture session truth into the
-                        // stored field at connect time. Every later
-                        // restore reads this field, never the UI state.
-                        sessionPubkey = base58
-                        // v0.1.5: capture the auth token from the
-                        // serving instance into its stored field at
-                        // the same moment. An adapter reset restores
-                        // the session from this field — the discarded
-                        // instance is never read.
-                        sessionAuthToken = adapter.authToken
-                        _uiState.value = WalletUiState.Connected(base58)
-                        Result.success(base58)
+                _uiState.value = WalletUiState.Working
+                val outcome = runCatching {
+                    runWalletOperation(PendingOperationKind.CONNECT, gen) {
+                        runConnectAttempts(sender, followInterruption)
+                    }
+                }.getOrElse { e ->
+                    return@withContext failIfCurrent(gen, e.message ?: "Connection failed", e)
+                }
+                // v0.1.4 zombie suppression: this caller may have been
+                // parked behind clientlib long after the reconciler (or
+                // the wrapper's own interrupted path) already resolved
+                // this generation — then its late result delivers
+                // nothing and writes nothing.
+                if (isStaleGeneration(gen)) {
+                    return@withContext Result.failure(WalletOperationAbandonedException())
+                }
+                when (outcome) {
+                    is ConnectOutcome.Threw ->
+                        failIfCurrent(gen, outcome.error.message ?: "Connection failed", outcome.error)
+                    is ConnectOutcome.Exhausted ->
+                        // Every loop attempt was swallowed: resolve
+                        // as an ordinary failure in the shell's
+                        // existing timeout vocabulary (the wallet
+                        // did not respond).
+                        failIfCurrent(gen, TIMEOUT_MESSAGE)
+                    is ConnectOutcome.Answered -> when (val result = outcome.result) {
+                        is TransactionResult.Success -> {
+                            val pubkeyBytes = result.authResult.accounts.firstOrNull()?.publicKey
+                            if (pubkeyBytes == null) {
+                                failIfCurrent(gen, "Wallet returned no accounts")
+                            } else {
+                                val base58 = Base58.encode(pubkeyBytes)
+                                // KFC-007: capture session truth into the
+                                // stored field at connect time. Every later
+                                // restore reads this field, never the UI state.
+                                sessionPubkey = base58
+                                // v0.1.5: capture the auth token from the
+                                // serving instance into its stored field at
+                                // the same moment. An adapter reset restores
+                                // the session from this field — the discarded
+                                // instance is never read. v0.1.6: after loop
+                                // resets, the serving instance is the final
+                                // attempt's adapter, carried by the outcome.
+                                sessionAuthToken = outcome.adapter.authToken
+                                _uiState.value = WalletUiState.Connected(base58)
+                                Result.success(base58)
+                            }
+                        }
+                        is TransactionResult.NoWalletFound ->
+                            failIfCurrent(gen, "No MWA-compatible wallet found on this device")
+                        is TransactionResult.Failure ->
+                            failIfCurrent(gen, result.e.message ?: "Wallet connection failed", result.e)
                     }
                 }
-                is TransactionResult.NoWalletFound ->
-                    failIfCurrent(gen, "No MWA-compatible wallet found on this device")
-                is TransactionResult.Failure ->
-                    failIfCurrent(gen, result.e.message ?: "Wallet connection failed", result.e)
+            } finally {
+                if (loopGeneration == gen) loopGeneration = 0
             }
         }
+
+    /**
+     * One connect call's outcome (v0.1.6, HAUNT v0.1.18's shape):
+     * a definitive wallet answer, a throw, or — loop only —
+     * exhaustion of every attempt without one. [Answered] carries
+     * the serving adapter instance: after loop resets, the session
+     * token must be captured from the instance that actually
+     * served, never from a discarded one (v0.1.5 token discipline).
+     * clientlib-ktx `connect()` returns `TransactionResult<Unit>`
+     * (the authorization rides on the Success's `authResult`).
+     */
+    private sealed interface ConnectOutcome {
+        data class Answered(
+            val result: TransactionResult<Unit>,
+            val adapter: MobileWalletAdapter
+        ) : ConnectOutcome
+
+        data class Threw(val error: Throwable) : ConnectOutcome
+
+        data object Exhausted : ConnectOutcome
+    }
+
+    /**
+     * The connect attempts behind ONE wallet operation (v0.1.6
+     * Element A — shape 2, ported from HAUNT v0.1.18 commit
+     * `635bfc5` as hardened by v0.1.19 commit `2ff0500`).
+     *
+     * A normal connect ([followInterruption] false) is a single
+     * direct call, awaited without a slot — the behavior of every
+     * previous build, unchanged.
+     *
+     * A connect following an interruption runs up to
+     * [INTERRUPTED_CONNECT_ATTEMPTS] attempts. Each attempt is a
+     * fresh `connect` call (a fresh association intent) on the
+     * then-current adapter instance — attempts after the first
+     * reset the adapter first (hygiene, as at the claim sites) —
+     * running as a child of this operation's coroutine and bounded
+     * by the [INTERRUPTED_ATTEMPT_TIMEOUT_MS] slot. An attempt
+     * whose outcome is SLOW — the slot expired, or any answer or
+     * throw that consumed more than [INTERRUPTED_SLOW_OUTCOME_MS]
+     * (clientlib's ~30 s association budget knocked out against a
+     * wallet busy with the zombie sheet) — is the swallowed-intent
+     * signature: the attempt is cancelled and abandoned (its late
+     * result is never read, never delivered, and writes no state —
+     * the only delivery and the only state writes for this
+     * operation happen once, in [connect], under the operation's
+     * generation guard) and the next attempt refires. A FAST
+     * definitive answer — Success or NoWalletFound at any speed,
+     * or a Failure/throw inside the slow threshold (a real wallet
+     * answer: a decline, an error) — ends the loop immediately and
+     * is processed normally. After the last slow attempt the
+     * connect resolves as [ConnectOutcome.Exhausted], an ordinary
+     * failure.
+     *
+     * Timer arithmetic against the 120 s backstop: the loop runs
+     * INSIDE the single operation the backstop wraps, so the worst
+     * case is 3 × 35 s slots + 2 × 0.5 s refire pauses = 106 s,
+     * inside the backstop with 14 s of headroom — the backstop
+     * cannot fire mid-loop and kill a live attempt 3, and its
+     * proven delivery behavior is preserved exactly for the
+     * pathological case and for every other operation (sign/pay
+     * never loop). The 35 s slot outlives clientlib's ~30 s
+     * association budget, so an attempt has fully exited before
+     * the next refires — no attempt ever fires into its
+     * predecessor's still-parked association.
+     */
+    private suspend fun runConnectAttempts(
+        sender: ActivityResultSender,
+        followInterruption: Boolean
+    ): ConnectOutcome = coroutineScope {
+        val maxAttempts = if (followInterruption) INTERRUPTED_CONNECT_ATTEMPTS else 1
+        var attempt = 0
+        var loopOutcome: ConnectOutcome? = null
+        while (loopOutcome == null) {
+            attempt++
+            if (attempt > 1) {
+                resetWalletAdapter()
+                delay(INTERRUPTED_REFIRE_PAUSE_MS)
+            }
+            // Per-attempt instance affinity (the v0.1.5 rule,
+            // applied per attempt): an attempt runs against the
+            // adapter instance current at ITS start.
+            val adapter = walletAdapter
+            val attemptDeferred = async {
+                try {
+                    ConnectOutcome.Answered(adapter.connect(sender), adapter)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    ConnectOutcome.Threw(e)
+                }
+            }
+            if (!followInterruption) {
+                return@coroutineScope attemptDeferred.await()
+            }
+            val attemptStartMs = SystemClock.elapsedRealtime()
+            val outcome = withTimeoutOrNull(INTERRUPTED_ATTEMPT_TIMEOUT_MS) {
+                attemptDeferred.await()
+            }
+            val elapsedMs = SystemClock.elapsedRealtime() - attemptStartMs
+            // Classification (HAUNT v0.1.19): within the loop, a
+            // SLOW outcome — the slot timeout, or any answer/throw
+            // that consumed the ~30 s association budget — is the
+            // swallowed-intent signature and refires while attempts
+            // remain. A FAST definitive answer ends the loop.
+            val slow = outcome == null || elapsedMs > INTERRUPTED_SLOW_OUTCOME_MS
+            val definitive = when (outcome) {
+                null -> false
+                is ConnectOutcome.Answered -> when (outcome.result) {
+                    is TransactionResult.Success,
+                    is TransactionResult.NoWalletFound -> true
+                    is TransactionResult.Failure -> !slow
+                }
+                is ConnectOutcome.Threw -> !slow
+                // Never produced by an attempt; exhaustiveness only.
+                is ConnectOutcome.Exhausted -> false
+            }
+            Log.d(
+                LOG_TAG,
+                "connect attempt $attempt/$maxAttempts outcome=" +
+                    (outcome?.javaClass?.simpleName ?: "timeout") +
+                    " elapsedMs=$elapsedMs slow=$slow definitive=$definitive"
+            )
+            when {
+                outcome != null && definitive -> loopOutcome = outcome
+                attempt >= maxAttempts -> {
+                    attemptDeferred.cancel()
+                    loopOutcome = ConnectOutcome.Exhausted
+                }
+                else -> {
+                    // Swallowed intent: abandon the attempt (its
+                    // late result is dropped unread) and refire.
+                    attemptDeferred.cancel()
+                }
+            }
+        }
+        // The loop exits only with an outcome assigned; the elvis
+        // satisfies the compiler, it cannot fire.
+        loopOutcome ?: ConnectOutcome.Exhausted
+    }
 
     /**
      * Ask the wallet to sign an arbitrary message (the game client's
@@ -633,6 +954,32 @@ class WalletManager {
          *  IO-side completion lands well inside this window; only a
          *  genuinely stranded operation is still Working after it. */
         const val FOREGROUND_RECONCILE_GRACE_MS: Long = 3_000L
+
+        /** v0.1.6 Element A: attempts for a connect that follows an
+         *  interruption (HAUNT v0.1.18/v0.1.19 values; see
+         *  [runConnectAttempts] for the timer arithmetic that keeps
+         *  the whole loop inside the 120 s backstop). */
+        private const val INTERRUPTED_CONNECT_ATTEMPTS = 3
+
+        /** v0.1.6: per-attempt slot — outlives clientlib's ~30 s
+         *  association budget, so an attempt completes naturally
+         *  inside it and a refire never fires into a still-parked
+         *  predecessor. */
+        private const val INTERRUPTED_ATTEMPT_TIMEOUT_MS = 35_000L
+
+        /** v0.1.6: an outcome slower than this inside the loop is
+         *  the swallowed-intent signature (the association budget
+         *  was consumed); at or under it, a definitive wallet
+         *  answer is FAST and ends the loop. */
+        private const val INTERRUPTED_SLOW_OUTCOME_MS = 25_000L
+
+        /** v0.1.6: pause between a swallowed attempt and its
+         *  refire (HAUNT's value). */
+        private const val INTERRUPTED_REFIRE_PAUSE_MS = 500L
+
+        /** v0.1.6: attempt-level observability (HAUNT v0.1.19) —
+         *  the loop's own Log.d account for the verdict lane. */
+        private const val LOG_TAG = "ZertGoblinWallet"
 
         /** Error-state text when the backstop resolves an operation
          *  directly (v0.1.4); identical to

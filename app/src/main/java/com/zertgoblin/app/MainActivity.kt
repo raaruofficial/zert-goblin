@@ -208,6 +208,17 @@ class MainActivity : ComponentActivity() {
         (application as ZertGoblinApp).walletManager.onForeground()
     }
 
+    override fun onStop() {
+        // v0.1.6 Element B (HAUNT v0.1.19): snapshot which wallet
+        // operation (if any) is pending as the app backgrounds —
+        // the foreground reconciler may resolve ONLY that
+        // generation; a request started later, in the foreground,
+        // is never a reconciliation candidate (see
+        // WalletManager.onAppBackgrounded).
+        (application as ZertGoblinApp).walletManager.onAppBackgrounded()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         if (::webView.isInitialized) webView.destroy()
         super.onDestroy()
