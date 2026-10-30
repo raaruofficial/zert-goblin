@@ -200,6 +200,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (::webView.isInitialized) webView.onResume()
+        // KFC-008: reconcile a wallet operation stranded by a
+        // foreground return — if the user left a wallet approval
+        // mid-handoff and came back without it resolving, the
+        // WalletManager cancels the stranded operation and restores
+        // state from session truth (see WalletManager.onForeground).
+        (application as ZertGoblinApp).walletManager.onForeground()
     }
 
     override fun onDestroy() {
