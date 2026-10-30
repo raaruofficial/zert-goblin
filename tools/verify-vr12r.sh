@@ -34,10 +34,14 @@
 #     is the client DOM, exposed in the dump as text nodes. Markers:
 #       working        -> "Connecting..." (launch button, disabled)
 #       resolved-error -> the abandonment access message (above)
-#       session        -> "Disconnect wallet" present AND the launch
-#                         button reads "Insert coin..." — both render
-#                         only when the client holds a server-issued
-#                         session. A session exists only after the
+#       session        -> the lobby banner reads "WALLET CONNECTED"
+#                         and the launch button reads "Insert
+#                         coin..." — both render only when the
+#                         client holds a server-issued session (the
+#                         DOM "Disconnect wallet" button sits below
+#                         the fold and is absent from the viewport
+#                         accessibility tree; r3 accepts it as an
+#                         alternative marker). A session exists only after the
 #                         MWA connect returned the mock key's pubkey
 #                         AND the mock signed the server nonce AND
 #                         the game server verified the ed25519
@@ -97,6 +101,8 @@ fatal_pkg_total="0"; fatal_mock_total="0"; ise_total="0"
 lock_pin="unknown"; lock_fp="unknown"; auth_note="not attempted"
 app_pid_start=""; app_pid_end=""
 resolution_s=""; resolution_form=""; retry_to_connected_s=""; sheets_after_retry="0"; approvals="0"
+# vr12s (scoping leg) verdict state
+s_cell="NOT-RUN"; s_fail_step=""; s_claimed=""; s_claimed_at_s=""; s_completed=""; s_pid_start=""; s_pid_end=""
 
 # --- helpers (carried from HAUNT's driver, JUDGE Amendment 2 hardening) ----
 dump_is_substantive() { # rejects hollow mid-transition dumps
@@ -467,7 +473,14 @@ adb logcat -c >/dev/null 2>&1 || true
 zert_state() { # $1 = dump file
   local f="$1"
   [ -f "$f" ] || { echo "nodump"; return; }
-  if grep -q "Disconnect wallet" "$f" && grep -q "Insert coin" "$f"; then echo "connected"
+  # Connected (r3, live-client truth — run 2's final dump): the lobby
+  # banner reads "WALLET CONNECTED ..." and the launch button "Insert
+  # coin · N free hunts ready"; the DOM "Disconnect wallet" button
+  # sits below the fold and is NOT in the viewport accessibility
+  # tree, so r1/r2's Disconnect+Insert-coin test never matched and
+  # run 2's completed retry was misread as "unknown". Accept either
+  # the banner or the legacy Disconnect+Insert-coin pair.
+  if grep -q "WALLET CONNECTED" "$f" || { grep -q "Disconnect wallet" "$f" && grep -q "Insert coin" "$f"; }; then echo "connected"
   elif grep -q "ABANDONED BEFORE IT FINISHED" "$f"; then echo "resolved-error"
   elif grep -q "Connecting" "$f"; then echo "working"
   elif grep -q "Connect wallet" "$f"; then echo "disconnected"
@@ -636,35 +649,47 @@ cell_vr12r() {
     return
   fi
   local t_retry; t_retry="$(date +%s)"
-  log "vr12r: retry tapped (one tap); approval loop budget 110s"
-  local sheets_seen="0" appr="0" est="unknown" loop_elapsed=0
+  log "vr12r: retry tapped (one tap); approval loop budget 110s (wall clock, r3)"
+  # r3: the loop is wall-clock bounded and foreground-directed —
+  # r2 incremented a nominal counter while each uiautomator dump
+  # took far longer than the nominal step, so the loop overran its
+  # budget in wall time and still never matched Connected (the
+  # detector defect above). Now: dump only for the package that is
+  # actually foreground, and bound by date, not by iteration count.
+  local sheets_seen="0" appr="0" est="unknown" loop_elapsed=0 fg=""
   while [ "$loop_elapsed" -lt 110 ]; do
-    est="$(zert_state_fg)"
-    if [ "$est" = "connected" ]; then break; fi
-    if dump_ui "$TMPD/retry-cur.xml" && sheet_present "$TMPD/retry-cur.xml"; then
-      sheets_seen=$((sheets_seen + 1))
-      cp "$TMPD/retry-cur.xml" "$OUT/hier-retry-sheet-$sheets_seen.xml" || true
-      snap "shot-retry-sheet-$sheets_seen.png"
-      log "vr12r: sheet #$sheets_seen presented after the retry tap (fg=$(fg_pkg))"
-      if tap_exact "$TMPD/retry-cur.xml" "Connect" || tap_text "$TMPD/retry-cur.xml" "Connect" || tap_exact "$TMPD/retry-cur.xml" "Approve" || tap_text "$TMPD/retry-cur.xml" "Approve"; then
-        appr=$((appr + 1))
-        log "vr12r: approved sheet #$sheets_seen (approvals=$appr)"
-        sleep 4
-        satisfy_auth_prompt || true
+    fg="$(fg_pkg)"
+    if [ "$fg" = "$MOCK" ]; then
+      if dump_ui "$TMPD/retry-cur.xml" && sheet_present "$TMPD/retry-cur.xml"; then
+        sheets_seen=$((sheets_seen + 1))
+        cp "$TMPD/retry-cur.xml" "$OUT/hier-retry-sheet-$sheets_seen.xml" || true
+        snap "shot-retry-sheet-$sheets_seen.png"
+        log "vr12r: sheet #$sheets_seen presented after the retry tap (fg=$(fg_pkg))"
+        if tap_exact "$TMPD/retry-cur.xml" "Connect" || tap_text "$TMPD/retry-cur.xml" "Connect" || tap_exact "$TMPD/retry-cur.xml" "Approve" || tap_text "$TMPD/retry-cur.xml" "Approve"; then
+          appr=$((appr + 1))
+          log "vr12r: approved sheet #$sheets_seen (approvals=$appr)"
+          sleep 4
+          satisfy_auth_prompt || true
+        fi
       fi
-    fi
-    sleep 3; loop_elapsed=$((loop_elapsed + 3))
-    est="$(zert_state_fg)"
-    if [ "$est" = "connected" ]; then break; fi
-    # Keep the app task reachable: if focus drifted to the launcher
-    # between sheets, bring Zert forward (am start on its singleTask
-    # activity — a focus change, never a restart).
-    if [ "$(fg_pkg)" != "$PKG" ] && [ "$(fg_pkg)" != "$MOCK" ]; then
+    elif [ "$fg" = "$PKG" ]; then
+      if dump_ui "$TMPD/retry-cur.xml"; then est="$(zert_state "$TMPD/retry-cur.xml")"; fi
+      if [ "$est" = "connected" ]; then break; fi
+    else
+      # Focus drifted (launcher/other): bring Zert forward — am
+      # start on its singleTask activity is a focus change, never
+      # a restart.
       adb shell am start -W -n "$ACT" >/dev/null 2>&1 || true
     fi
+    sleep 2
+    loop_elapsed=$(( $(date +%s) - t_retry ))
   done
   sheets_after_retry="$sheets_seen"; approvals="$appr"
-  retry_to_connected_s="$(( $(date +%s) - t_retry ))"
+  if [ "$est" = "connected" ]; then
+    retry_to_connected_s="$(( $(date +%s) - t_retry ))"
+  else
+    retry_to_connected_s="$(( $(date +%s) - t_retry ))"
+  fi
   dump_ui "$OUT/hier-final.xml" || true
   snap "shot-final.png"
   app_pid_end="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r')"
@@ -690,8 +715,165 @@ cell_vr12r() {
   log "vr12r: PASS — retry completed in-process: $sheets_seen sheet(s), $appr approval(s), Connected ${retry_to_connected_s}s after the retry tap"
 }
 
+# --- vr12s: THE SCOPING LEG -------------------------------------------------
+# Second defect layer (HAUNT v0.1.18 verdict, main relay 2026-10-30):
+# the v0.1.16-shape reconciler arms on foreground return with a
+# snapshot taken AT foreground time. A request started in the
+# foreground that spans a LATER background->resume cycle is in that
+# snapshot, and if it is still legitimately in flight past the 3 s
+# grace it is claimed, resolved to Error, and (v0.1.5) the adapter
+# is reset — even though nobody abandoned it. MWA association
+# legitimately takes ~30 s (HAUNT's measurement), so slow-but-
+# healthy connects are the exposed class.
+#
+# Leg design: fresh state (pm clear — pid continuity is asserted
+# WITHIN the leg) -> tap Connect -> authorize sheet in flight ->
+# HOME -> return to ZERT (the spanning resume) -> poll the state
+# for 14 s: the request must stay Working the whole window (any
+# failed-closed form while the sheet sits unanswered = claimed) ->
+# bring the wallet task forward -> approve authorize + sign ->
+# Connected within 60 s. PASS requires BOTH: never claimed AND
+# completed on its own terms, same process.
+bring_mock_forward() { # surface the in-flight sheet's task
+  # (1) am start on the singleTask sheet activity: brings its task
+  # forward; the live instance receives the intent (no onNewIntent
+  # override — the existing sheet is what shows).
+  adb shell am start -W -n "com.solana.mwallet/.MobileWalletAdapterActivity" >/dev/null 2>&1 || true
+  sleep 2
+  if [ "$(fg_pkg)" = "$MOCK" ] && dump_ui "$TMPD/mock-fwd.xml" && sheet_present "$TMPD/mock-fwd.xml"; then
+    log "vr12s: wallet task forward via am start (sheet activity)"; return 0
+  fi
+  # (2) stack move-task on the mock's task id from recents.
+  local tid
+  tid="$(adb shell dumpsys activity recents 2>/dev/null | grep -i -B4 'A=com.solana.mwallet' | grep -oE '#[0-9]+' | tail -1 | tr -d '#')"
+  if [ -n "$tid" ]; then
+    adb shell am stack move-task "$tid" true >/dev/null 2>&1 || true
+    sleep 2
+    if [ "$(fg_pkg)" = "$MOCK" ] && dump_ui "$TMPD/mock-fwd.xml" && sheet_present "$TMPD/mock-fwd.xml"; then
+      log "vr12s: wallet task forward via stack move-task $tid"; return 0
+    fi
+  fi
+  # (3) recents + center tap on the first card (screenshot filed).
+  adb shell input keyevent 187 >/dev/null 2>&1 || true
+  sleep 2
+  snap "shot-s-recents.png"
+  local wh w h
+  wh="$(adb shell wm size 2>/dev/null | grep -oE '[0-9]+x[0-9]+' | head -1)"
+  w="${wh%x*}"; h="${wh#*x}"
+  if [ -n "$w" ] && [ -n "$h" ]; then
+    adb shell input tap $((w / 2)) $((h / 3)) >/dev/null 2>&1 || true
+    sleep 2
+    if [ "$(fg_pkg)" = "$MOCK" ] && dump_ui "$TMPD/mock-fwd.xml" && sheet_present "$TMPD/mock-fwd.xml"; then
+      log "vr12s: wallet task forward via recents center tap"; return 0
+    fi
+  fi
+  log "vr12s: could not bring the wallet task forward (fg=$(fg_pkg))"
+  return 1
+}
+
+cell_vr12s() {
+  log "=== vr12s: foreground-started connect spanning a background->resume past grace must NOT be claimed ==="
+  auth_fresh_enough
+  # Fresh leg state: clear the app (vr12r may have ended Connected).
+  # The leg asserts pid continuity from its own launch onward.
+  adb shell pm clear "$PKG" >/dev/null 2>&1 || true
+  sleep 1
+  if ! goto_lobby; then s_cell="FAIL"; s_fail_step="lobby"; log "vr12s: FAIL step=lobby — could not reach the lobby"; return; fi
+  local st; st="$(zert_state "$OUT/hier-lobby.xml")"
+  if [ "$st" != "disconnected" ]; then s_cell="FAIL"; s_fail_step="precondition"; log "vr12s: FAIL step=precondition — lobby state=$st after pm clear"; return; fi
+  s_pid_start="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r')"
+  log "vr12s: app pid at leg start = $s_pid_start"
+  adb logcat -c >/dev/null 2>&1 || true
+  dump_ui "$TMPD/s-pre.xml" || true
+  if ! tap_text "$TMPD/s-pre.xml" "Connect wallet"; then s_cell="FAIL"; s_fail_step="connect-tap"; log "vr12s: FAIL step=connect-tap"; return; fi
+  log "vr12s: connect tapped (foreground start); waiting for the authorize sheet"
+  if ! wait_sheet "$OUT/hier-s-sheet1.xml" 45; then s_cell="FAIL"; s_fail_step="first-sheet"; log "vr12s: FAIL step=first-sheet — no authorize sheet within 45s"; return; fi
+  snap "shot-s-sheet1.png"
+  log "vr12s: authorize sheet in flight — backgrounding WITHOUT answering (the request stays legitimately in flight)"
+  adb shell input keyevent 3 >/dev/null 2>&1 || true
+  sleep 3
+  snap "shot-s-backgrounded.png"
+  # The spanning resume: bring Zert forward while the sheet is
+  # still unanswered in the wallet task. onResume arms the
+  # reconciler with this request in its snapshot.
+  adb shell am start -W -n "$ACT" >/dev/null 2>&1 || true
+  local t_resume; t_resume="$(date +%s)"
+  log "vr12s: Zert resumed with the connect still in flight; polling 14s across the 3s grace"
+  local elapsed=0 pst="working"
+  s_claimed="0"; s_claimed_at_s=""
+  while [ "$elapsed" -lt 14 ]; do
+    if [ "$(fg_pkg)" = "$PKG" ] && dump_ui "$TMPD/s-poll.xml"; then
+      cp "$TMPD/s-poll.xml" "$OUT/hier-s-poll-${elapsed}s.xml" || true
+      pst="$(zert_state "$TMPD/s-poll.xml")"
+    else
+      pst="not-fg"
+    fi
+    log "vr12s: post-resume poll ${elapsed}s: state=$pst (fg=$(fg_pkg))"
+    case "$pst" in
+      disconnected|resolved-error)
+        s_claimed="1"; s_claimed_at_s="$elapsed"
+        log "vr12s: RECONCILER CLAIMED the in-flight request at ~${elapsed}s post-resume (form=$pst) while the wallet sheet sat unanswered"
+        break ;;
+    esac
+    sleep 2; elapsed=$(( $(date +%s) - t_resume ))
+  done
+  dump_ui "$OUT/hier-s-after-grace.xml" || true
+  snap "shot-s-after-grace.png"
+  capture_window "s-grace"
+  # Completion on its own terms: surface the still-unanswered sheet
+  # and approve it (authorize, then Zert's sign-proof sheet).
+  if ! bring_mock_forward; then
+    s_completed="0"
+    if [ "$s_claimed" = "1" ]; then s_cell="FAIL"; s_fail_step="reconciler-claim";
+    else s_cell="FAIL"; s_fail_step="wallet-forward"; fi
+    log "vr12s: FAIL step=$s_fail_step — sheet could not be surfaced for approval (claimed=$s_claimed)"
+    return
+  fi
+  cp "$TMPD/mock-fwd.xml" "$OUT/hier-s-sheet-live.xml" || true
+  snap "shot-s-sheet-live.png"
+  local t_appr; t_appr="$(date +%s)"; local s_sheets=0 s_appr=0 est2="unknown"
+  while [ $(( $(date +%s) - t_appr )) -lt 60 ]; do
+    local fg2; fg2="$(fg_pkg)"
+    if [ "$fg2" = "$MOCK" ]; then
+      if dump_ui "$TMPD/s-cur.xml" && sheet_present "$TMPD/s-cur.xml"; then
+        s_sheets=$((s_sheets + 1))
+        cp "$TMPD/s-cur.xml" "$OUT/hier-s-retry-sheet-$s_sheets.xml" || true
+        if tap_exact "$TMPD/s-cur.xml" "Connect" || tap_text "$TMPD/s-cur.xml" "Connect" || tap_exact "$TMPD/s-cur.xml" "Approve" || tap_text "$TMPD/s-cur.xml" "Approve"; then
+          s_appr=$((s_appr + 1)); log "vr12s: approved sheet #$s_sheets (approvals=$s_appr)"; sleep 4; satisfy_auth_prompt || true
+        fi
+      fi
+    elif [ "$fg2" = "$PKG" ]; then
+      if dump_ui "$TMPD/s-cur.xml"; then est2="$(zert_state "$TMPD/s-cur.xml")"; fi
+      if [ "$est2" = "connected" ]; then break; fi
+    else
+      adb shell am start -W -n "$ACT" >/dev/null 2>&1 || true
+    fi
+    sleep 2
+  done
+  if dump_ui "$TMPD/s-final.xml" && [ "$(fg_pkg)" = "$PKG" ]; then est2="$(zert_state "$TMPD/s-final.xml")"; cp "$TMPD/s-final.xml" "$OUT/hier-s-final.xml" || true; fi
+  snap "shot-s-final.png"
+  s_pid_end="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r')"
+  log "vr12s: completion end state=$est2 (sheets=$s_sheets approvals=$s_appr; claimed=$s_claimed at=${s_claimed_at_s:-none}s; pid $s_pid_start -> $s_pid_end)"
+  if [ "$est2" = "connected" ]; then s_completed="1"; else s_completed="0"; fi
+  if [ "$s_pid_start" != "$s_pid_end" ] || [ -z "$s_pid_end" ]; then
+    s_cell="FAIL"; s_fail_step="process"; log "vr12s: FAIL step=process — pid changed ($s_pid_start -> $s_pid_end)"; return
+  fi
+  if [ "$s_claimed" = "1" ]; then
+    s_cell="FAIL"; s_fail_step="reconciler-claim"
+    log "vr12s: FAIL step=reconciler-claim — the spanning resume's reconciler resolved a legitimate in-flight connect at ~${s_claimed_at_s}s post-resume (grace 3s); completion_after_claim=$s_completed"
+    return
+  fi
+  if [ "$s_completed" != "1" ]; then
+    s_cell="FAIL"; s_fail_step="completion"; log "vr12s: FAIL step=completion — never claimed, but the request did not complete after approval (end state=$est2)"; return
+  fi
+  s_cell="PASS"
+  log "vr12s: PASS — the in-flight connect survived the spanning resume unclaimed and completed on its own terms"
+}
+
 cell_vr12r
 capture_window "final"
+cell_vr12s
+capture_window "s-final"
 
 # --- verdict -----------------------------------------------------------------
 if [ "$cell" = "PASS" ] && { [ "$fatal_pkg_total" -gt 0 ] || [ "$fatal_mock_total" -gt 0 ] || [ "$ise_total" -gt 0 ]; }; then
@@ -715,7 +897,14 @@ fi
   echo "lock_fp=$lock_fp"
   echo "mock_auth=$auth_note"
   echo "expected_pubkey=$EXPECTED_PUBKEY"
+  echo "leg_vr12s=$s_cell"
+  [ -n "$s_fail_step" ] && echo "leg_vr12s_fail_step=$s_fail_step"
+  echo "leg_vr12s_claimed=$s_claimed"
+  echo "leg_vr12s_claimed_at_s=$s_claimed_at_s"
+  echo "leg_vr12s_completed=$s_completed"
+  echo "leg_vr12s_pid_start=$s_pid_start"
+  echo "leg_vr12s_pid_end=$s_pid_end"
 } > "$OUT/verdict.txt"
 cat "$OUT/verdict.txt" | tee -a "$LANE_LOG"
 log "vr12r: verdict written to $OUT/verdict.txt"
-[ "$cell" = "PASS" ]
+[ "$cell" = "PASS" ] && [ "$s_cell" = "PASS" ]

@@ -70,12 +70,45 @@ zombie sheet surfacing and being approved to no effect, then no
 Connected inside the budget (`fail_step=retry-connect` or
 `retry-sheet`).
 
+## The second leg — vr12s (reconciler scoping)
+
+Added 2026-10-30 on main's relay (HAUNT v0.1.18 verdict). The
+reconciler in the v0.1.16 shape arms at foreground time with no
+background-time generation snapshot and no retry-generation
+exemption, so a **legitimate** connect started in the foreground
+that spans a later background→resume cycle can be claimed and
+resolved as if abandoned. The leg: fresh state (`pm clear`; pid
+continuity is asserted within the leg) → tap Connect → sheet in
+flight → HOME → return to **Zert** while the sheet is still
+unanswered → poll 14 s across the 3 s grace (the request must
+stay `Connecting…` the whole window; any failed-closed form =
+claimed, with the post-resume second recorded) → surface the
+wallet task (am start on the singleTask sheet activity, stack
+move-task, recents tap — in that order) → approve authorize +
+sign → Connected within 60 s. **PASS requires both**: never
+claimed AND completed on its own terms, same process. Verdict
+lines are the `leg_vr12s_*` keys in `verdict.txt`.
+
+Run history note (driver r3): r1's resolution gate demanded the
+access-message form and stopped before the retry; r2 recorded the
+trajectory but its session detector required `Disconnect wallet`
+in the dump — that button is below the fold and absent from the
+viewport tree, so r2's run (41034285910) actually **completed**
+the retry (both sheets approved, session reached) yet reported
+`unknown`. r3's detector reads the live client's real connected
+markers (`WALLET CONNECTED` banner / `Insert coin…` launch
+button), the approval loop is wall-clock bounded and
+foreground-directed, and the vr12s leg runs in the same suite.
+
 ## Observation surfaces — and their limits
 
 - **Hierarchy dumps** (uiautomator). Zert's state is its WebView
   DOM: `Connecting…` (working), the abandonment access message
-  (resolved-error), and — for the session state — `Disconnect
-  wallet` present with the launch button reading `Insert coin…`.
+  (resolved-error), and — for the session state — the lobby
+  banner `WALLET CONNECTED` with the launch button reading
+  `Insert coin…` (r3; the DOM `Disconnect wallet` button is
+  below the fold and not in the viewport accessibility tree —
+  its presence is accepted as an alternative marker only).
 - **The pubkey is never rendered by Zert's client.** The session
   grade is nonetheless key-bound: a session exists only after the
   MWA connect returned the mock key's pubkey, the mock signed the
