@@ -18,7 +18,7 @@
 </style></head><body><main>
 <nav><a href="index.html">← Zert Goblin</a></nav>
 <h1>Zert Goblin — Privacy Policy</h1>
-<p><strong>Effective date:</strong> October 27, 2026</p>
+<p><strong>Effective date:</strong> October 29, 2026</p>
 <h2>1. Who we are</h2>
 <p><strong>"We" is Raaru</strong>, the publisher of Zert Goblin. Contact for privacy
 questions, data requests, and deletion requests:
@@ -104,8 +104,22 @@ to or spendable by another:</p>
 <li><strong>To Jupiter (only if you open "Stack real ZEC"):</strong> the swap runs in
   Jupiter's official plugin under its own terms; your wallet interacts
   with Jupiter directly. The game server receives nothing from it.</li>
+<li><strong>To the Solana Mobile Seeker Connect relay</strong> (<code>relay.solanamobile.com</code>)
+  — <strong>only when you connect a wallet through Seeker Connect in a
+  browser:</strong> your browser first opens Solana Mobile's connect page to
+  reach your wallet, and the wallet session then runs over a relay
+  Solana Mobile operates. The session's messages — connection and
+  signing requests and their responses — pass through the relay
+  <strong>encrypted between the game and your wallet</strong>, so the relay routes
+  them without being able to read their contents. Like any relay
+  operator, it can see the routing metadata: that a session occurred,
+  when, its size, and the network addresses of the two endpoints.
+  Inside the Seeker app itself, the wallet connection is local to
+  the device and no relay is involved. The game server receives
+  nothing from the relay, and nothing in this flow changes what the
+  game server holds (§3).</li>
 <li><strong>To your own client:</strong> cabinet state, leaderboard, and store data.</li>
-<li><strong>No other recipient exists in the product.</strong></li>
+<li><strong>That is the complete list of recipients.</strong></li>
 </ul>
 <h2>6. How data is used</h2>
 <p>Only to run the game: persist plays/balances/skins per wallet,
