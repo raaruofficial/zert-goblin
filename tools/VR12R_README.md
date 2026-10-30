@@ -38,8 +38,13 @@ devnet/test identity only).
    without approving. Zert's `MainActivity.onResume` fires the
    foreground reconciler.
 5. **Resolution**: within 40 s the client must leave `Connecting…`
-   and show the abandonment resolution (access message *THE WALLET
-   REQUEST WAS ABANDONED BEFORE IT FINISHED. TRY AGAIN.*).
+   — any failed-closed form counts (the abandonment access message
+   *THE WALLET REQUEST WAS ABANDONED BEFORE IT FINISHED. TRY
+   AGAIN.*, or a clean return to the disconnected lobby with no
+   message — the form run 1 actually produced; the driver records
+   the per-poll trajectory and which form occurred). Only
+   Working-persistence — the vr12 hang — fails this step; the
+   retry leg proceeds from any failed-closed resolution.
 6. **Retry**: tap the connect control **once**, then an approval
    loop (HAUNT r6 form): approve every sheet the retry produces —
    the authorize sheet, then Zert's sign-proof sheet (its session

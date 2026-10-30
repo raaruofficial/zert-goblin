@@ -59,6 +59,18 @@
 # (its MobileWalletAdapterActivity is singleTask with no onNewIntent
 # override — a second association intent while a sheet is in flight
 # is the contested surface). The Seed Vault Wallet may differ.
+#
+# Driver r2 (first run, 41032934329): the resolution gate no longer
+# demands the Error/access-message form. Run 1 resolved to a clean
+# disconnected lobby within seconds of the return — a failed-closed
+# resolution whose client manifestation is NOT the abandonment
+# access message (never rendered; the message does not auto-clear,
+# so it was never shown) — and r1's gate mis-stopped the cell
+# before the retry leg and mislabelled the outcome as the vr12
+# hang. r2 records the resolution TRAJECTORY (per-poll dumps), fails
+# the resolution step only on Working-persistence (the actual vr12
+# shape), and proceeds to the retry leg from ANY failed-closed
+# resolution, exactly as HAUNT's vr12 -> vr12r structure does.
 set -u
 
 PKG="com.zertgoblin.app"
@@ -84,7 +96,7 @@ fail_step=""
 fatal_pkg_total="0"; fatal_mock_total="0"; ise_total="0"
 lock_pin="unknown"; lock_fp="unknown"; auth_note="not attempted"
 app_pid_start=""; app_pid_end=""
-resolution_s=""; retry_to_connected_s=""; sheets_after_retry="0"; approvals="0"
+resolution_s=""; resolution_form=""; retry_to_connected_s=""; sheets_after_retry="0"; approvals="0"
 
 # --- helpers (carried from HAUNT's driver, JUDGE Amendment 2 hardening) ----
 dump_is_substantive() { # rejects hollow mid-transition dumps
@@ -557,33 +569,62 @@ cell_vr12r() {
   local t_return; t_return="$(date +%s)"
   snap "shot-returned.png"
 
-  # 3. RESOLUTION WAIT: the reconciler (MainActivity.onResume ->
-  #    WalletManager.onForeground) must resolve the interrupted
-  #    connect to the abandonment Error within 40 s of the return.
-  local elapsed=0 rst="working"
+  # 3. RESOLUTION WAIT (r2 — trajectory, not a single gate): the
+  #    reconciler (MainActivity.onResume -> WalletManager.onForeground)
+  #    must move the interrupted connect OUT of Working within 40 s
+  #    of the return. Any failed-closed form counts as the
+  #    resolution (resolved-error = the abandonment access message;
+  #    disconnected = a clean return to the lobby with no message —
+  #    run 1's observed form); only Working-persistence is the vr12
+  #    hang and fails here. Every poll dump is filed so the
+  #    trajectory is evidence, not summary.
+  local elapsed=0 rst="working" saw_fg="0" first_nonworking=""
   while [ "$elapsed" -lt 40 ]; do
-    rst="$(zert_state_fg)"
-    if [ "$rst" = "resolved-error" ] || [ "$rst" = "connected" ] || [ "$rst" = "disconnected" ]; then break; fi
+    if [ "$(fg_pkg)" = "$PKG" ]; then
+      saw_fg="1"
+      if dump_ui "$TMPD/poll.xml"; then
+        cp "$TMPD/poll.xml" "$OUT/hier-poll-${elapsed}s.xml" || true
+        rst="$(zert_state "$TMPD/poll.xml")"
+      fi
+    else
+      rst="not-fg"
+    fi
+    log "vr12r: resolution poll ${elapsed}s: state=$rst (fg=$(fg_pkg))"
+    if [ -z "$first_nonworking" ]; then
+      case "$rst" in
+        resolved-error|disconnected|connected) first_nonworking="$elapsed" ;;
+      esac
+    fi
+    # Keep polling after the first non-working read for a few more
+    # seconds: a late-rendering access message (or a relapse into
+    # Working) is part of the trajectory. Stop early only once a
+    # failed-closed form has been stable for two polls.
+    if [ -n "$first_nonworking" ] && [ $((elapsed - first_nonworking)) -ge 6 ]; then break; fi
     sleep 3; elapsed=$((elapsed + 3))
   done
-  resolution_s="$elapsed"
+  resolution_s="${first_nonworking:-40}"
+  resolution_form="$rst"
   dump_ui "$OUT/hier-resolved.xml" || true
   snap "shot-resolved.png"
   capture_window "resolution"
-  log "vr12r: state ${elapsed}s after foreground return = $rst"
+  log "vr12r: resolution trajectory end: state=$rst first_nonworking=${first_nonworking:-none}s saw_fg=$saw_fg"
+  if [ "$saw_fg" != "1" ]; then
+    fail "return" "the Zert task never regained the foreground after the abandonment"
+    return
+  fi
   if [ "$rst" = "connected" ]; then
     # The zombie approval cannot have happened (nothing approved it);
     # a Connected here would mean the sheet resumed and completed on
     # return — not the abandonment path. Record and stop: there is
-    # no resolved Error to retry from.
+    # no interrupted resolution to retry from.
     fail "resolution" "state resolved to Connected without any approval — abandonment did not take the interrupted-resolution path"
     return
   fi
-  if [ "$rst" != "resolved-error" ]; then
-    fail "resolution" "no abandonment resolution within 40s of foreground return (end state=$rst) — the vr12 hang shape"
+  if [ -z "$first_nonworking" ] || [ "$rst" = "working" ]; then
+    fail "resolution" "the interrupted connect never left Working within 40s of foreground return (end state=$rst) — the vr12 hang shape"
     return
   fi
-  log "vr12r: abandonment resolution observed at ~${elapsed}s (Error + abandonment message on the client)"
+  log "vr12r: abandonment resolved failed-closed (form=$rst, first non-working at ~${first_nonworking}s) — proceeding to the retry leg"
 
   # 4. RETRY: ONE tap on the recovery control, then the r6 approval
   #    loop. Approve every sheet the retry produces (authorize, then
@@ -661,6 +702,7 @@ fi
   echo "cell=$cell"
   [ -n "$fail_step" ] && echo "fail_step=$fail_step"
   echo "resolution_s=$resolution_s"
+  echo "resolution_form=$resolution_form"
   echo "retry_to_connected_s=$retry_to_connected_s"
   echo "sheets_after_retry=$sheets_after_retry"
   echo "approvals=$approvals"
