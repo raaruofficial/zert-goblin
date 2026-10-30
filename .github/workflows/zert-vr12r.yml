@@ -8,8 +8,8 @@ name: Zert vr12r cell (KFC-008 retry leg)
 # association intent while the zombie sheet is in flight). The bar
 # is UNMET until this cell passes against the real Mock MWA Wallet.
 #
-# Defaults target the sealed v0.1.5 candidate (Android CI run
-# 41029854434, artefact 12965581620, sha256 f7bc4705...4800).
+# Defaults target the sealed v0.1.7 candidate (Android CI run
+# 41046425847, artefact 12972776870, sha256 f5543401...6d9).
 # To grade another build, pass its artifact id + sha256.
 # A workflow_dispatch file must exist on the DEFAULT branch to run.
 
@@ -19,11 +19,11 @@ on:
       apk_artifact_id:
         description: Artifact id (this repo) holding the target release APK
         type: string
-        default: "12965581620"
+        default: "12972776870"
       expected_sha256:
         description: sha256 gate for the target APK
         type: string
-        default: "f7bc47056743ac86caa56037147d69fee07d8899c8c31a1c54ff5a64dda64800"
+        default: "f554340116767da6a9bc6aeb474f343333c322ddcac7770d1cc32e59c642b6d9"
       api_level:
         description: Emulator API level
         type: choice

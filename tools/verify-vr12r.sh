@@ -15,49 +15,85 @@
 #   3. ABANDON: HOME, then return to the ZERT task via recents
 #      (never approving the sheet). Zert's MainActivity.onResume
 #      fires the foreground reconciler.
-#   4. RESOLUTION: Zert must leave "Connecting..." and surface the
-#      abandonment resolution (access message "THE WALLET REQUEST
-#      WAS ABANDONED BEFORE IT FINISHED. TRY AGAIN." — the client
-#      uppercases WalletManager's message) within 40 s.
+#   4. RESOLUTION (r4: wire-graded): the reconciler's claim must
+#      DELIVER — since v0.1.7 the claim posts a `claim-delivery
+#      requestId=... gen=...` Log.d line (tag ZertGoblinWallet) and
+#      settles the gen-1 JS request with the ABANDONED failure
+#      inside the post-resume grace window. That marker — not any
+#      DOM form — proves resolution. If the zombie unwinds before
+#      the claim can fire (the wallet removes the claim's object),
+#      resolution is recorded as delivered-via-unwind and the leg
+#      proceeds; the claim sub-criterion is then "not exercised",
+#      stated in the verdict. Absent both -> FAIL
+#      step=resolution-delivery, distinct from any loop failure.
 #   5. RETRY: tap the connect control ONCE. Approval loop (HAUNT r6
-#      form, 110 s budget): whenever a Mock sheet is up, approve it
-#      (Connect on the authorize sheet, Approve on the sign-proof
-#      sheet — Zert's session flow signs a server nonce right after
-#      connect, so a cured retry produces TWO sheets).
+#      form, 150 s budget — derivation in the r4 notes below):
+#      whenever a Mock sheet is up, approve it (Connect on the
+#      authorize sheet, Approve on the sign-proof sheet — Zert's
+#      session flow signs a server nonce right after connect, so a
+#      cured retry produces TWO sheets).
 #   6. PASS only if, in the SAME process (pid continuity asserted):
-#      a sheet presented after the retry tap, at least one approval
-#      completed, and Zert reaches its session state (see below)
-#      within 110 s of the retry tap.
+#      the claim-delivery for gen-1 landed in the grace window (or
+#      the unwind path is recorded); the retry tap produced a fresh
+#      association scenario on the wire; on the claim path — where
+#      the claim raises lastRequestInterrupted — the refire loop
+#      logged at least one attempt line (on the unwind path the
+#      loop is not armed by design and the retry is graded on the
+#      single-attempt bar); a sheet presented after the retry tap;
+#      at least one approval completed; and Zert reaches its
+#      session state (DOM Connected — the one DOM criterion kept)
+#      within 150 s of the retry tap.
 #
-# OBSERVATION SURFACES (what the grades rest on):
-#   - uiautomator hierarchy dumps. Zert is a WebView shell: its state
-#     is the client DOM, exposed in the dump as text nodes. Markers:
-#       working        -> "Connecting..." (launch button, disabled)
-#       resolved-error -> the abandonment access message (above)
-#       session        -> the lobby banner reads "WALLET CONNECTED"
-#                         and the launch button reads "Insert
-#                         coin..." — both render only when the
-#                         client holds a server-issued session (the
-#                         DOM "Disconnect wallet" button sits below
-#                         the fold and is absent from the viewport
-#                         accessibility tree; r3 accepts it as an
-#                         alternative marker). A session exists only after the
-#                         MWA connect returned the mock key's pubkey
-#                         AND the mock signed the server nonce AND
-#                         the game server verified the ed25519
-#                         signature — so the session state is bound
-#                         to the mock's pubkey even though the client
-#                         never renders the pubkey string itself.
-#                         The mock-side anchor: the mock main screen
-#                         shows the imported key's address; the
-#                         driver asserts it equals EXPECTED_PUBKEY.
-#       disconnected   -> "Connect wallet" control, no session marks
-#   - Foreground package tracking (dumpsys) for sheet presence:
-#     sheet = fg is com.solana.mwallet AND the dump carries the
-#     sheet's Connect/Approve/Cancel controls.
+# OBSERVATION SURFACES (what the grades rest on, r4):
+#   - WIRE MARKERS (primary since r4): a continuous logcat stream
+#     (`adb logcat -v epoch`) is captured to logcat-stream.txt for
+#     the whole run and queried at every decision point, so ring-
+#     buffer rotation no longer bounds the evidence. Markers:
+#       scenario created  -> "LocalAssociationScenario: Creating
+#                            local association scenario" (app pid):
+#                            an association attempt actually fired;
+#                            one per connect attempt (incl. refires)
+#                            and per sign operation.
+#       session ready     -> "LocalAssociationScenario: Session
+#                            established, scenario ready for use".
+#       loop attempt      -> "ZertGoblinWallet: connect attempt
+#                            N/3 outcome=... elapsedMs=...
+#                            slow=... definitive=..." — the refire
+#                            loop's own per-attempt account.
+#       claim delivery    -> "ZertGoblinWallet: claim-delivery
+#                            requestId=... gen=..." — the v0.1.7
+#                            bridge settlement firing at claim time.
+#       authorize done    -> mock-side "BaseScenario: Authorize
+#                            request completed successfully".
+#       consumption       -> app-side "JsonRpc20Client: JSON-RPC
+#                            2.0 message received" followed within
+#                            ~1-3 s by "MobileWalletAdapterWebSocket:
+#                            close" on a DIFFERENT tid than the
+#                            receive (the app consuming the result
+#                            and tearing the scenario down). The
+#                            zombie-death contrast: a scenario
+#                            disconnect with NO receipt in the
+#                            preceding seconds, plus the mock-side
+#                            "authorization request declined".
+#       scenario teardown -> "LocalAssociationScenario:
+#                            Disconnected during normal operation".
+#   - uiautomator hierarchy dumps: used to DRIVE the cell (taps,
+#     sheet presence via foreground package + sheet controls) and
+#     for the final Connected criterion ONLY (the lobby banner
+#     "WALLET CONNECTED" / "Insert coin..." launch button — a
+#     session exists only after the MWA connect returned the mock
+#     key's pubkey AND the mock signed the server nonce AND the
+#     game server verified the ed25519 signature, so the session
+#     state is bound to the mock's pubkey even though the client
+#     never renders the pubkey string itself; the DOM "Disconnect
+#     wallet" button below the fold is accepted as an alternative
+#     marker with "Insert coin"). DOM state at every other poll is
+#     filed as evidence and NEVER gates (see the r4 notes).
+#     The mock-side anchor: the mock main screen shows the imported
+#     key's address; the driver asserts it equals EXPECTED_PUBKEY.
 #   - logcat windows: any AndroidRuntime FATAL for either package,
 #     or an ActivityResultSender-signature IllegalStateException,
-#     poisons the verdict (HAUNT scan rule).
+#     poisons the verdict (HAUNT scan rule; unchanged).
 #
 # SCOPE: the verdict binds to the MOCK MWA Wallet's intent handling
 # (its MobileWalletAdapterActivity is singleTask with no onNewIntent
@@ -75,6 +111,57 @@
 # the resolution step only on Working-persistence (the actual vr12
 # shape), and proceeds to the retry leg from ANY failed-closed
 # resolution, exactly as HAUNT's vr12 -> vr12r structure does.
+#
+# Driver r4 (this revision) — DETECTOR REDESIGN, per
+# VR12R_CELL_V016.md SS6 follow-up 2 and the v0.1.7 strike record.
+# The v0.1.6 run proved the DOM detector cannot grade these legs
+# on this client: the deployed lobby renders NO in-flight state
+# (its only "Connecting..." string lives in the PurchaseSheet), so
+# a "disconnected" poll is consistent with no attempt, an attempt
+# in flight, and an attempt resolved alike; r3's vr12s poll also
+# broke on its first (uninformative) read and never observed the
+# grace window. Itemized changes vs r3:
+#   (1) Continuous logcat stream in epoch format for the whole
+#       run; all grading queries run against the stream file.
+#   (2) vr12r resolution is graded on the claim-delivery wire
+#       marker for gen-1 inside the post-resume grace window
+#       (allowance 25 s from resume: the reconciler grace is 3 s,
+#       battery #6 measured the delivery at 3.0-3.2 s; the rest is
+#       clock-skew/render margin) — a build whose claim never
+#       delivers fails step=resolution-delivery HERE. The DOM
+#       trajectory is still dumped per poll as evidence.
+#       Unwind-before-claim is recorded as resolution_path=unwind
+#       (claim sub-criterion not exercised), never silently
+#       upgraded to a claim grade.
+#   (3) Retry budget 110 s -> 150 s, derived from the loop's own
+#       arithmetic: worst case 3 attempts x 35 s slots + 2 x 0.5 s
+#       refire gaps = 106 s, plus ~44 s for approvals and the
+#       session flow. A PASS on attempt 3 is therefore inside the
+#       budget by construction, and a FAIL is not excused by it.
+#   (4) Retry grading adds wire criteria — a fresh scenario after
+#       the tap (step=retry-scenario) and >=1 loop attempt line
+#       after the tap (step=retry-attempt) — and extracts the
+#       per-attempt topology into the verdict: scenario epochs,
+#       attempt-line epochs/classifications, the zombie-death
+#       epoch, and which attempt's sheet landed (attributed by
+#       timing: the latest scenario created before the first
+#       post-retry sheet was observed).
+#   (5) vr12s: the post-resume poll spans the FULL grace window
+#       (14 s) with NO early break. Claimed = a claim-delivery
+#       marker inside the window (the spanning connect is the
+#       only live bridge request, so any in-window claim-delivery
+#       targets it) or its wire signature breaking (spanning
+#       scenario disconnects with no preceding receipt). DOM
+#       polls are evidence only. Never-claimed is thus a positive
+#       wire observation across the whole window, not a DOM
+#       absence.
+#   (6) vr12s completion is graded on the consumption signature
+#       (authorize-completed mock-side + app-side receipt +
+#       app-initiated close on a different tid within 3 s) plus
+#       the DOM Connected criterion. Claim-prong and
+#       consumption-prong failures are DISTINCT steps
+#       (reconciler-claim vs completion-consumption/completion),
+#       never blurred.
 set -u
 
 PKG="com.zertgoblin.app"
@@ -101,8 +188,17 @@ fatal_pkg_total="0"; fatal_mock_total="0"; ise_total="0"
 lock_pin="unknown"; lock_fp="unknown"; auth_note="not attempted"
 app_pid_start=""; app_pid_end=""
 resolution_s=""; resolution_form=""; retry_to_connected_s=""; sheets_after_retry="0"; approvals="0"
+# vr12r r4 wire-marker verdict state
+resolution_path=""        # claim | unwind | none
+claim_gen=""; claim_delivery_offset_s=""; claim_exercised=""
+zombie_death_offset_s=""  # relative to the retry tap (negative = died before it)
+retry_scenarios="0"; retry_attempts="0"; retry_budget_s="150"; sheet_attempt=""
 # vr12s (scoping leg) verdict state
 s_cell="NOT-RUN"; s_fail_step=""; s_claimed=""; s_claimed_at_s=""; s_completed=""; s_pid_start=""; s_pid_end=""
+# vr12s r4 wire-marker verdict state
+s_claim_form=""           # claim-delivery | wire-break | ""
+s_consumption=""          # authorize/receipt/close booleans, e.g. 1/1/1
+s_sign_sheets="0"
 
 # --- helpers (carried from HAUNT's driver, JUDGE Amendment 2 hardening) ----
 dump_is_substantive() { # rejects hollow mid-transition dumps
@@ -237,6 +333,157 @@ capture_window() { # $1 = tag; dumps logcat since last clear into evidence + sca
   scan_logcat "$OUT/logcat-$1.txt"
   adb logcat -c >/dev/null 2>&1 || true
 }
+
+# --- r4: continuous logcat stream + wire-marker queries -----------------
+# The stream is the primary grading record: `adb logcat -v epoch`
+# runs for the whole cell (both legs) into $STREAM, so ring-buffer
+# rotation (~2 min on this emulator image) cannot eat marker lines.
+# The capture_window dumps above remain the crash-scan surface.
+STREAM="$OUT/logcat-stream.txt"
+STREAM_PID=""
+start_stream() {
+  : > "$STREAM"
+  adb logcat -c >/dev/null 2>&1 || true
+  adb logcat -v epoch > "$STREAM" 2>/dev/null &
+  STREAM_PID=$!
+  log "stream: logcat -v epoch streaming to $STREAM (pid $STREAM_PID)"
+}
+stop_stream() {
+  if [ -n "$STREAM_PID" ]; then kill "$STREAM_PID" >/dev/null 2>&1 || true; STREAM_PID=""; fi
+}
+
+# mq — marker query over the stream file.
+#   mq count <regex> <after_epoch> [pid]     -> integer count
+#   mq first <regex> <after_epoch> [pid]     -> "epoch tid" of first match (empty if none)
+#   mq epochs <regex> <after_epoch> [pid]    -> space-separated epochs of every match
+#   mq lines <regex> <after_epoch> [pid]     -> the matching raw lines
+# Epoch lines look like: "1761876341.587  5269  5467 V Tag: message".
+# Non-matching lines (buffer banners etc.) are skipped. The regex is
+# matched against the "Tag: message" tail; pid (field 2) is an exact
+# filter when given.
+mq() {
+  python3 - "$STREAM" "$@" <<'PY'
+import re, sys
+path, mode, pattern, after = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+pid = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+rx = re.compile(pattern)
+line_rx = re.compile(r"^(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
+hits = []
+try:
+    fh = open(path, encoding="utf-8", errors="ignore")
+except OSError:
+    fh = []
+for ln in fh:
+    m = line_rx.match(ln)
+    if not m:
+        continue
+    epoch, lpid, tid, tail = float(m.group(1)), m.group(2), m.group(3), m.group(4)
+    if epoch < after:
+        continue
+    if pid is not None and lpid != pid:
+        continue
+    if rx.search(tail):
+        hits.append((epoch, tid, ln.rstrip("\n")))
+if mode == "count":
+    print(len(hits))
+elif mode == "first":
+    if hits:
+        print(f"{hits[0][0]:.3f} {hits[0][1]}")
+elif mode == "epochs":
+    print(" ".join(f"{h[0]:.3f}" for h in hits))
+elif mode == "lines":
+    for h in hits:
+        print(h[2])
+PY
+}
+
+# zombie_death_epoch <after_epoch> <app_pid> [appside] — the gen-1
+# (or spanning) scenario's death WITHOUT consumption: first of
+# (a) the mock-side "authorization request declined" line,
+# (b) an app-side scenario disconnect whose preceding 3 s hold no
+# app-side JSON-RPC receipt. With the "appside" scope, branch (a)
+# is skipped: a decline line cannot be attributed to a specific
+# scenario from its text alone, so vr12s (where a previous leg's
+# zombie could decline late) grades only on its own process's
+# disconnects. Prints the epoch (empty if still alive).
+zombie_death_epoch() {
+  python3 - "$STREAM" "$1" "$2" "${3:-}" <<'PY'
+import re, sys
+path, after, pid = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+appside = len(sys.argv) > 4 and sys.argv[4] == "appside"
+line_rx = re.compile(r"^(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
+decline = None
+receipts = []
+disconnects = []
+try:
+    fh = open(path, encoding="utf-8", errors="ignore")
+except OSError:
+    fh = []
+for ln in fh:
+    m = line_rx.match(ln)
+    if not m:
+        continue
+    epoch, lpid, tail = float(m.group(1)), m.group(2), m.group(4)
+    if epoch < after:
+        continue
+    if "authorization request declined" in tail and decline is None:
+        decline = epoch
+    if lpid == pid and "JsonRpc20Client: JSON-RPC 2.0 message received" in tail:
+        receipts.append(epoch)
+    if lpid == pid and "LocalAssociationScenario: Disconnected" in tail:
+        disconnects.append(epoch)
+cands = []
+if decline is not None and not appside:
+    cands.append(decline)
+for d in disconnects:
+    if not any(0 <= d - r <= 3.0 for r in receipts):
+        cands.append(d)
+        break
+print(f"{min(cands):.3f}" if cands else "")
+PY
+}
+
+# consumption_after <after_epoch> <app_pid> — the consumption
+# signature following an approval: mock-side authorize completion,
+# then an app-side JSON-RPC receipt, then an app-initiated websocket
+# close on a DIFFERENT tid within 3 s of the receipt. Prints
+# "authz receipt close receipt_epoch close_epoch" with 0/1 flags
+# (epochs 0 when absent).
+consumption_after() {
+  python3 - "$STREAM" "$1" "$2" <<'PY'
+import re, sys
+path, after, pid = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+line_rx = re.compile(r"^(\d+\.\d+)\s+(\d+)\s+(\d+)\s+[VDIWEA] (.*)$")
+authz = 0
+receipt = None  # (epoch, tid)
+close = None
+try:
+    fh = open(path, encoding="utf-8", errors="ignore")
+except OSError:
+    fh = []
+for ln in fh:
+    m = line_rx.match(ln)
+    if not m:
+        continue
+    epoch, lpid, tid, tail = float(m.group(1)), m.group(2), m.group(3), m.group(4)
+    if epoch < after:
+        continue
+    if "Authorize request completed successfully" in tail:
+        authz = 1
+    if lpid == pid and receipt is None and "JsonRpc20Client: JSON-RPC 2.0 message received" in tail:
+        receipt = (epoch, tid)
+        continue
+    if (lpid == pid and receipt is not None and close is None
+            and re.search(r"MobileWalletAdapterWebSocket: close\s*$", tail)
+            and tid != receipt[1] and 0 <= epoch - receipt[0] <= 3.0):
+        close = epoch
+r_e = f"{receipt[0]:.3f}" if receipt else "0"
+c_e = f"{close:.3f}" if close else "0"
+print(f"{authz} {1 if receipt else 0} {1 if close else 0} {r_e} {c_e}")
+PY
+}
+
+host_now() { date +%s.%N; }
 
 # --- device record -----------------------------------------------------
 adb wait-for-device
@@ -565,6 +812,12 @@ cell_vr12r() {
   log "vr12r: authorize sheet in flight (fg=$(fg_pkg))"
 
   # 2. ABANDON: HOME, then return to the ZERT task without approving.
+  #    r4: the gen-1 scenario's wire birth is recorded first — the
+  #    claim-delivery and zombie queries below are anchored to it.
+  local t_connect; t_connect="$(host_now)"
+  local gen1; gen1="$(mq first 'LocalAssociationScenario: Creating local association scenario' 0 "$app_pid_start")"
+  log "vr12r: gen-1 scenario on the wire: ${gen1:-none} (connect tap ~$t_connect)"
+  local t_abandon; t_abandon="$(host_now)"
   log "vr12r: ABANDON — HOME (backgrounding both tasks), no approval"
   adb shell input keyevent 3 >/dev/null 2>&1 || true
   sleep 3
@@ -578,20 +831,33 @@ cell_vr12r() {
     adb shell am start -W -n "$ACT" >/dev/null 2>&1 || true
     log "vr12r: no labelled Zert card matched; brought the Zert task forward via am start"
   fi
+  # t_resume: the return action has landed; onForeground (and the
+  # reconciler's 3 s grace) runs from here. Marker offsets are
+  # measured against this epoch; marker SEARCHES anchor 2 s
+  # earlier to absorb any host/device clock skew.
+  local t_resume; t_resume="$(host_now)"
+  local t_resume_anchor; t_resume_anchor="$(python3 -c "print(f'{$t_resume - 2:.3f}')")"
   sleep 2
   local t_return; t_return="$(date +%s)"
   snap "shot-returned.png"
 
-  # 3. RESOLUTION WAIT (r2 — trajectory, not a single gate): the
-  #    reconciler (MainActivity.onResume -> WalletManager.onForeground)
-  #    must move the interrupted connect OUT of Working within 40 s
-  #    of the return. Any failed-closed form counts as the
-  #    resolution (resolved-error = the abandonment access message;
-  #    disconnected = a clean return to the lobby with no message —
-  #    run 1's observed form); only Working-persistence is the vr12
-  #    hang and fails here. Every poll dump is filed so the
-  #    trajectory is evidence, not summary.
-  local elapsed=0 rst="working" saw_fg="0" first_nonworking=""
+  # 3. RESOLUTION WAIT (r4 — WIRE-GRADED): the reconciler's claim
+  #    must DELIVER. The proof is the claim-delivery marker for the
+  #    gen-1 generation landing inside the post-resume grace window
+  #    (allowance 25 s from t_resume; grace 3 s + battery anchor
+  #    3.0-3.2 s + skew margin). DOM dumps are filed per poll as
+  #    evidence and never gate — on this client a "disconnected"
+  #    poll is consistent with no attempt, an in-flight attempt,
+  #    and a resolved attempt alike (VR12R_CELL_V016 SS3).
+  #    If the zombie unwinds before the claim can fire (mock-side
+  #    decline / scenario disconnect with no preceding receipt),
+  #    the wallet removed the claim's object: resolution is
+  #    recorded as delivered-via-unwind, the claim sub-criterion is
+  #    marked NOT exercised, and the leg proceeds — the retry
+  #    still grades the loop. Absent both within 40 s of the
+  #    resume -> FAIL step=resolution-delivery: the claim never
+  #    delivered, distinct from any loop failure.
+  local elapsed=0 rst="unknown" saw_fg="0" claim_hit="" unwind_hit="" late_claim=""
   while [ "$elapsed" -lt 40 ]; do
     if [ "$(fg_pkg)" = "$PKG" ]; then
       saw_fg="1"
@@ -599,28 +865,38 @@ cell_vr12r() {
         cp "$TMPD/poll.xml" "$OUT/hier-poll-${elapsed}s.xml" || true
         rst="$(zert_state "$TMPD/poll.xml")"
       fi
-    else
-      rst="not-fg"
     fi
-    log "vr12r: resolution poll ${elapsed}s: state=$rst (fg=$(fg_pkg))"
-    if [ -z "$first_nonworking" ]; then
-      case "$rst" in
-        resolved-error|disconnected|connected) first_nonworking="$elapsed" ;;
-      esac
+    claim_hit="$(mq first 'ZertGoblinWallet: claim-delivery requestId=' "$t_resume_anchor" )"
+    if [ -n "$claim_hit" ]; then
+      local claim_epoch="${claim_hit%% *}"
+      claim_delivery_offset_s="$(python3 -c "print(f'{$claim_epoch - $t_resume:.1f}')")"
+      claim_gen="$(mq lines 'ZertGoblinWallet: claim-delivery requestId=' "$t_resume_anchor" | head -n 1 | sed -n 's/.* gen=\([0-9]*\).*/\1/p')"
+      if python3 -c "exit(0 if $claim_delivery_offset_s <= 25 else 1)"; then
+        resolution_path="claim"; claim_exercised="1"
+      else
+        # A claim-delivery exists but landed outside the grace
+        # allowance — recorded as such; it is not an in-window
+        # delivery and does not prove this step.
+        log "vr12r: claim-delivery landed LATE (offset ${claim_delivery_offset_s}s > 25s allowance, gen=$claim_gen)"
+        late_claim="$claim_delivery_offset_s"
+        claim_hit=""
+      fi
     fi
-    # Keep polling after the first non-working read for a few more
-    # seconds: a late-rendering access message (or a relapse into
-    # Working) is part of the trajectory. Stop early only once a
-    # failed-closed form has been stable for two polls.
-    if [ -n "$first_nonworking" ] && [ $((elapsed - first_nonworking)) -ge 6 ]; then break; fi
+    if [ -z "$claim_hit" ]; then
+      unwind_hit="$(zombie_death_epoch "$t_abandon" "$app_pid_start")"
+      if [ -n "$unwind_hit" ]; then
+        resolution_path="unwind"; claim_exercised="0"
+      fi
+    fi
+    log "vr12r: resolution poll ${elapsed}s: dom=$rst claim=${claim_hit:-none} unwind=${unwind_hit:-none} (fg=$(fg_pkg))"
+    if [ -n "$claim_hit" ] || [ -n "$unwind_hit" ]; then break; fi
     sleep 3; elapsed=$((elapsed + 3))
   done
-  resolution_s="${first_nonworking:-40}"
+  resolution_s="${claim_delivery_offset_s:-$elapsed}"
   resolution_form="$rst"
   dump_ui "$OUT/hier-resolved.xml" || true
   snap "shot-resolved.png"
   capture_window "resolution"
-  log "vr12r: resolution trajectory end: state=$rst first_nonworking=${first_nonworking:-none}s saw_fg=$saw_fg"
   if [ "$saw_fg" != "1" ]; then
     fail "return" "the Zert task never regained the foreground after the abandonment"
     return
@@ -633,35 +909,44 @@ cell_vr12r() {
     fail "resolution" "state resolved to Connected without any approval — abandonment did not take the interrupted-resolution path"
     return
   fi
-  if [ -z "$first_nonworking" ] || [ "$rst" = "working" ]; then
-    fail "resolution" "the interrupted connect never left Working within 40s of foreground return (end state=$rst) — the vr12 hang shape"
+  if [ "$resolution_path" = "claim" ]; then
+    log "vr12r: resolution PROVEN on the wire — claim-delivery gen=$claim_gen at +${claim_delivery_offset_s}s after resume (grace window)"
+    mq lines 'ZertGoblinWallet: claim-delivery requestId=' "$t_resume_anchor" | head -n 2 | tee -a "$LANE_LOG" || true
+  elif [ "$resolution_path" = "unwind" ]; then
+    log "vr12r: resolution delivered via UNWIND at epoch $unwind_hit (zombie died before the claim could fire) — claim sub-criterion NOT exercised this run"
+  else
+    fail "resolution-delivery" "no in-window claim-delivery for gen-1 within 40s of the resume and no zombie-unwind signature — the reconciler's claim never delivered in its grace window (dom end state=$rst${late_claim:+, late claim at +${late_claim}s})"
     return
   fi
-  log "vr12r: abandonment resolved failed-closed (form=$rst, first non-working at ~${first_nonworking}s) — proceeding to the retry leg"
+  log "vr12r: abandonment resolved (path=$resolution_path, dom form=$rst) — proceeding to the retry leg"
 
-  # 4. RETRY: ONE tap on the recovery control, then the r6 approval
-  #    loop. Approve every sheet the retry produces (authorize, then
-  #    Zert's sign-proof sheet); Connected must arrive in-process
-  #    within 110 s of the tap.
+  # 4. RETRY (r4): ONE tap on the recovery control, then the r6
+  #    approval loop. Approve every sheet the retry produces
+  #    (authorize, then Zert's sign-proof sheet); Connected must
+  #    arrive in-process within the 150 s budget. The budget is
+  #    derived from the loop's own arithmetic (KFC008_SHAPE2_
+  #    STRIKE): 3 attempts x 35 s slots + 2 x 0.5 s refire gaps =
+  #    106 s worst case, + ~44 s for two approvals and the session
+  #    flow. A PASS on attempt 3 is inside budget by construction.
   dump_ui "$TMPD/retry-pre.xml" || true
   if ! tap_text "$TMPD/retry-pre.xml" "Connect wallet"; then
     fail "retry-tap" "no connect control on the resolved screen"
     return
   fi
+  local t_retry_f; t_retry_f="$(host_now)"
   local t_retry; t_retry="$(date +%s)"
-  log "vr12r: retry tapped (one tap); approval loop budget 110s (wall clock, r3)"
-  # r3: the loop is wall-clock bounded and foreground-directed —
-  # r2 incremented a nominal counter while each uiautomator dump
-  # took far longer than the nominal step, so the loop overran its
-  # budget in wall time and still never matched Connected (the
-  # detector defect above). Now: dump only for the package that is
-  # actually foreground, and bound by date, not by iteration count.
-  local sheets_seen="0" appr="0" est="unknown" loop_elapsed=0 fg=""
-  while [ "$loop_elapsed" -lt 110 ]; do
+  log "vr12r: retry tapped (one tap) at epoch $t_retry_f; approval loop budget ${retry_budget_s}s (r4: 106s loop worst case + approval margin)"
+  # r3 discipline kept: the loop is wall-clock bounded and
+  # foreground-directed — dump only for the package that is
+  # actually foreground, bound by date, not by iteration count.
+  # r4 adds the first-sheet epoch for attempt attribution.
+  local sheets_seen="0" appr="0" est="unknown" loop_elapsed=0 fg="" t_first_sheet=""
+  while [ "$loop_elapsed" -lt "$retry_budget_s" ]; do
     fg="$(fg_pkg)"
     if [ "$fg" = "$MOCK" ]; then
       if dump_ui "$TMPD/retry-cur.xml" && sheet_present "$TMPD/retry-cur.xml"; then
         sheets_seen=$((sheets_seen + 1))
+        if [ -z "$t_first_sheet" ]; then t_first_sheet="$(host_now)"; fi
         cp "$TMPD/retry-cur.xml" "$OUT/hier-retry-sheet-$sheets_seen.xml" || true
         snap "shot-retry-sheet-$sheets_seen.png"
         log "vr12r: sheet #$sheets_seen presented after the retry tap (fg=$(fg_pkg))"
@@ -685,22 +970,60 @@ cell_vr12r() {
     loop_elapsed=$(( $(date +%s) - t_retry ))
   done
   sheets_after_retry="$sheets_seen"; approvals="$appr"
-  if [ "$est" = "connected" ]; then
-    retry_to_connected_s="$(( $(date +%s) - t_retry ))"
-  else
-    retry_to_connected_s="$(( $(date +%s) - t_retry ))"
-  fi
+  retry_to_connected_s="$(( $(date +%s) - t_retry ))"
   dump_ui "$OUT/hier-final.xml" || true
   snap "shot-final.png"
   app_pid_end="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r')"
+
+  # r4 wire accounting for the retry phase (from the stream):
+  # every scenario created after the tap (connect attempts incl.
+  # refires, then the sign-proof scenario), every loop attempt
+  # line, the zombie's death, and which attempt's sheet landed.
+  local scen_epochs attempt_lines zdeath
+  scen_epochs="$(mq epochs 'LocalAssociationScenario: Creating local association scenario' "$t_retry_f" "$app_pid_start")"
+  retry_scenarios="$(mq count 'LocalAssociationScenario: Creating local association scenario' "$t_retry_f" "$app_pid_start")"
+  attempt_lines="$(mq lines 'ZertGoblinWallet: connect attempt ' "$t_retry_f")"
+  retry_attempts="$(mq count 'ZertGoblinWallet: connect attempt ' "$t_retry_f")"
+  zdeath="$(zombie_death_epoch "$t_abandon" "$app_pid_start")"
+  if [ -n "$zdeath" ]; then
+    zombie_death_offset_s="$(python3 -c "print(f'{$zdeath - $t_retry_f:.1f}')")"
+  fi
+  if [ -n "$t_first_sheet" ] && [ -n "$scen_epochs" ]; then
+    sheet_attempt="$(python3 -c "
+epochs=[float(x) for x in '$scen_epochs'.split()]
+n=sum(1 for e in epochs if e <= $t_first_sheet)
+print(n if n else '')")"
+  fi
+  log "vr12r: wire topology after the retry tap: scenarios=$retry_scenarios (epochs: ${scen_epochs:-none})"
+  log "vr12r: loop attempt lines=$retry_attempts; zombie death epoch=${zdeath:-alive} (offset vs retry tap: ${zombie_death_offset_s:-n/a}s); sheet landed on attempt=${sheet_attempt:-unknown}"
+  if [ -n "$attempt_lines" ]; then printf '%s\n' "$attempt_lines" | tee -a "$LANE_LOG" || true; fi
   log "vr12r: end state=$est after ${loop_elapsed}s loop (sheets=$sheets_seen approvals=$appr; pid start=$app_pid_start end=$app_pid_end)"
 
   if [ "$app_pid_start" != "$app_pid_end" ] || [ -z "$app_pid_end" ]; then
     fail "process" "app pid changed across the cell ($app_pid_start -> $app_pid_end) — not an in-process recovery"
     return
   fi
+  if [ "$retry_scenarios" -lt 1 ]; then
+    fail "retry-scenario" "the retry tap produced NO fresh association scenario on the wire within ${retry_budget_s}s — the tap never became a connect (sheets=$sheets_seen, end state=$est)"
+    return
+  fi
+  # The attempt-line criterion binds ONLY on the claim path: a
+  # reconciler claim raises lastRequestInterrupted (WalletManager),
+  # so the retry connect MUST run the loop and log its attempts.
+  # On the unwind path nothing raised the flag (the deferred
+  # completed on its own; no claim, no interrupted wrapper exit),
+  # so the retry is a plain single-attempt connect by design —
+  # grading it on scenario + sheet + approval + Connected (the
+  # pre-loop bar) and recording the attempt count as information.
+  if [ "$resolution_path" = "claim" ] && [ "$retry_attempts" -lt 1 ]; then
+    fail "retry-attempt" "resolution came via a claim (loop armed) and a scenario fired after the retry tap, but the refire loop logged no attempt line — the loop did not run this connect (scenarios=$retry_scenarios, end state=$est)"
+    return
+  fi
+  if [ "$resolution_path" = "unwind" ]; then
+    log "vr12r: unwind path — loop not armed by design; retry graded on the single-attempt bar (attempt lines=$retry_attempts, informational)"
+  fi
   if [ "$sheets_seen" -lt 1 ]; then
-    fail "retry-sheet" "no wallet sheet presented after the retry tap within 110s (approvals=$appr, end state=$est)"
+    fail "retry-sheet" "no wallet sheet presented after the retry tap within ${retry_budget_s}s (scenarios=$retry_scenarios attempts=$retry_attempts, end state=$est)"
     return
   fi
   if [ "$appr" -lt 1 ]; then
@@ -708,11 +1031,11 @@ cell_vr12r() {
     return
   fi
   if [ "$est" != "connected" ]; then
-    fail "retry-connect" "retry did not reach Connected in-process within 110s (sheets=$sheets_seen approvals=$appr, end state=$est) — the vr12r failure shape"
+    fail "retry-connect" "retry did not reach Connected in-process within ${retry_budget_s}s (sheets=$sheets_seen approvals=$appr scenarios=$retry_scenarios attempts=$retry_attempts, end state=$est) — the vr12r failure shape"
     return
   fi
   cell="PASS"
-  log "vr12r: PASS — retry completed in-process: $sheets_seen sheet(s), $appr approval(s), Connected ${retry_to_connected_s}s after the retry tap"
+  log "vr12r: PASS — retry completed in-process: $sheets_seen sheet(s), $appr approval(s), Connected ${retry_to_connected_s}s after the retry tap; resolution path=$resolution_path, scenarios=$retry_scenarios, loop attempts=$retry_attempts, sheet on attempt=${sheet_attempt:-unknown}"
 }
 
 # --- vr12s: THE SCOPING LEG -------------------------------------------------
@@ -728,12 +1051,14 @@ cell_vr12r() {
 #
 # Leg design: fresh state (pm clear — pid continuity is asserted
 # WITHIN the leg) -> tap Connect -> authorize sheet in flight ->
-# HOME -> return to ZERT (the spanning resume) -> poll the state
-# for 14 s: the request must stay Working the whole window (any
-# failed-closed form while the sheet sits unanswered = claimed) ->
-# bring the wallet task forward -> approve authorize + sign ->
-# Connected within 60 s. PASS requires BOTH: never claimed AND
-# completed on its own terms, same process.
+# HOME -> return to ZERT (the spanning resume) -> observe the FULL
+# 14 s grace window on WIRE markers (r4; no early break, DOM filed
+# as evidence only): claimed = an in-window claim-delivery marker
+# or the spanning scenario's wire signature breaking -> bring the
+# wallet task forward -> approve authorize + sign -> consumption
+# signature on the wire + Connected within 60 s. PASS requires
+# BOTH: never claimed AND completed on its own terms, same
+# process. Claim and consumption failures are distinct steps.
 bring_mock_forward() { # surface the in-flight sheet's task
   # (1) am start on the singleTask sheet activity: brings its task
   # forward; the live instance receives the intent (no onNewIntent
@@ -785,22 +1110,41 @@ cell_vr12s() {
   log "vr12s: app pid at leg start = $s_pid_start"
   adb logcat -c >/dev/null 2>&1 || true
   dump_ui "$TMPD/s-pre.xml" || true
+  local t0; t0="$(host_now)"
   if ! tap_text "$TMPD/s-pre.xml" "Connect wallet"; then s_cell="FAIL"; s_fail_step="connect-tap"; log "vr12s: FAIL step=connect-tap"; return; fi
   log "vr12s: connect tapped (foreground start); waiting for the authorize sheet"
   if ! wait_sheet "$OUT/hier-s-sheet1.xml" 45; then s_cell="FAIL"; s_fail_step="first-sheet"; log "vr12s: FAIL step=first-sheet — no authorize sheet within 45s"; return; fi
   snap "shot-s-sheet1.png"
+  local span_scen; span_scen="$(mq first 'LocalAssociationScenario: Creating local association scenario' "$t0" "$s_pid_start")"
+  log "vr12s: spanning scenario on the wire: ${span_scen:-none}"
   log "vr12s: authorize sheet in flight — backgrounding WITHOUT answering (the request stays legitimately in flight)"
   adb shell input keyevent 3 >/dev/null 2>&1 || true
   sleep 3
   snap "shot-s-backgrounded.png"
   # The spanning resume: bring Zert forward while the sheet is
-  # still unanswered in the wallet task. onResume arms the
-  # reconciler with this request in its snapshot.
+  # still unanswered in the wallet task.
   adb shell am start -W -n "$ACT" >/dev/null 2>&1 || true
+  local t_resume_f; t_resume_f="$(host_now)"
+  local t_resume_anchor; t_resume_anchor="$(python3 -c "print(f'{$t_resume_f - 2:.3f}')")"
   local t_resume; t_resume="$(date +%s)"
-  log "vr12s: Zert resumed with the connect still in flight; polling 14s across the 3s grace"
-  local elapsed=0 pst="working"
-  s_claimed="0"; s_claimed_at_s=""
+  # r4 GRACE WINDOW — WIRE-GRADED, FULL WINDOW, NO EARLY BREAK
+  # (r3's poll broke on its first DOM read — a reading that is
+  # temporally incapable of being a claim, since the reconciler
+  # fires at the earliest ~resume+6s, and DOM-confounded besides;
+  # VR12R_CELL_V016 SS2/SS3). The poll now runs the FULL 14 s
+  # across the 3 s grace and grades on wire markers only:
+  #   claimed = a claim-delivery marker inside the window (the
+  #     spanning connect is the only live bridge request, so any
+  #     in-window claim-delivery targets it), OR the spanning
+  #     scenario's wire signature breaking (disconnect with no
+  #     preceding receipt / wallet-side decline).
+  #   never-claimed = neither marker across the whole window AND
+  #     the scenario still live at window end — a positive wire
+  #     observation, not a DOM absence.
+  # DOM state is dumped per poll as evidence and never gates.
+  log "vr12s: Zert resumed with the connect still in flight; observing the FULL 14s grace window on wire markers (no early break)"
+  local elapsed=0 pst="unknown"
+  s_claimed="0"; s_claimed_at_s=""; s_claim_form=""
   while [ "$elapsed" -lt 14 ]; do
     if [ "$(fg_pkg)" = "$PKG" ] && dump_ui "$TMPD/s-poll.xml"; then
       cp "$TMPD/s-poll.xml" "$OUT/hier-s-poll-${elapsed}s.xml" || true
@@ -808,29 +1152,40 @@ cell_vr12s() {
     else
       pst="not-fg"
     fi
-    log "vr12s: post-resume poll ${elapsed}s: state=$pst (fg=$(fg_pkg))"
-    case "$pst" in
-      disconnected|resolved-error)
-        s_claimed="1"; s_claimed_at_s="$elapsed"
-        log "vr12s: RECONCILER CLAIMED the in-flight request at ~${elapsed}s post-resume (form=$pst) while the wallet sheet sat unanswered"
-        break ;;
-    esac
+    local claim_now break_now
+    claim_now="$(mq first 'ZertGoblinWallet: claim-delivery requestId=' "$t_resume_anchor")"
+    break_now="$(zombie_death_epoch "$t_resume_anchor" "$s_pid_start" appside)"
+    if [ "$s_claimed" != "1" ] && [ -n "$claim_now" ]; then
+      s_claimed="1"; s_claim_form="claim-delivery"
+      s_claimed_at_s="$(python3 -c "print(f'{${claim_now%% *} - $t_resume_f:.1f}')")"
+      log "vr12s: CLAIM-DELIVERY marker inside the grace window at +${s_claimed_at_s}s post-resume — the spanning connect was claimed"
+      mq lines 'ZertGoblinWallet: claim-delivery requestId=' "$t_resume_anchor" | head -n 2 | tee -a "$LANE_LOG" || true
+    elif [ "$s_claimed" != "1" ] && [ -n "$break_now" ]; then
+      s_claimed="1"; s_claim_form="wire-break"
+      s_claimed_at_s="$(python3 -c "print(f'{$break_now - $t_resume_f:.1f}')")"
+      log "vr12s: WIRE SIGNATURE BROKE inside the grace window at +${s_claimed_at_s}s post-resume — the spanning scenario died unreceipted"
+    fi
+    log "vr12s: grace poll ${elapsed}s: dom=$pst claimed=$s_claimed form=${s_claim_form:-none} (fg=$(fg_pkg))"
     sleep 2; elapsed=$(( $(date +%s) - t_resume ))
   done
   dump_ui "$OUT/hier-s-after-grace.xml" || true
   snap "shot-s-after-grace.png"
   capture_window "s-grace"
+  if [ "$s_claimed" != "1" ]; then
+    log "vr12s: grace window closed — NO claim marker and the spanning scenario's wire signature intact across the full window (never-claimed is a positive wire observation)"
+  fi
   # Completion on its own terms: surface the still-unanswered sheet
   # and approve it (authorize, then Zert's sign-proof sheet).
   if ! bring_mock_forward; then
     s_completed="0"
     if [ "$s_claimed" = "1" ]; then s_cell="FAIL"; s_fail_step="reconciler-claim";
     else s_cell="FAIL"; s_fail_step="wallet-forward"; fi
-    log "vr12s: FAIL step=$s_fail_step — sheet could not be surfaced for approval (claimed=$s_claimed)"
+    log "vr12s: FAIL step=$s_fail_step — sheet could not be surfaced for approval (claimed=$s_claimed form=${s_claim_form:-none})"
     return
   fi
   cp "$TMPD/mock-fwd.xml" "$OUT/hier-s-sheet-live.xml" || true
   snap "shot-s-sheet-live.png"
+  local t_appr_f; t_appr_f="$(host_now)"
   local t_appr; t_appr="$(date +%s)"; local s_sheets=0 s_appr=0 est2="unknown"
   while [ $(( $(date +%s) - t_appr )) -lt 60 ]; do
     local fg2; fg2="$(fg_pkg)"
@@ -853,27 +1208,50 @@ cell_vr12s() {
   if dump_ui "$TMPD/s-final.xml" && [ "$(fg_pkg)" = "$PKG" ]; then est2="$(zert_state "$TMPD/s-final.xml")"; cp "$TMPD/s-final.xml" "$OUT/hier-s-final.xml" || true; fi
   snap "shot-s-final.png"
   s_pid_end="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r')"
-  log "vr12s: completion end state=$est2 (sheets=$s_sheets approvals=$s_appr; claimed=$s_claimed at=${s_claimed_at_s:-none}s; pid $s_pid_start -> $s_pid_end)"
+  # r4 consumption accounting (wire): did the shell consume the
+  # approved authorize? authorize-completed (mock) + app-side
+  # receipt + app-initiated close on a different tid within 3 s.
+  local cons; cons="$(consumption_after "$t_appr_f" "$s_pid_start")"
+  local c_authz c_receipt c_close c_r_epoch c_c_epoch
+  read -r c_authz c_receipt c_close c_r_epoch c_c_epoch <<< "$cons"
+  s_consumption="$c_authz/$c_receipt/$c_close"
+  s_sign_sheets="$s_sheets"
+  log "vr12s: consumption signature after approval: authorize-completed=$c_authz receipt=$c_receipt app-close=$c_close (receipt epoch=$c_r_epoch, close epoch=$c_c_epoch)"
+  log "vr12s: completion end state=$est2 (sheets=$s_sheets approvals=$s_appr; claimed=$s_claimed form=${s_claim_form:-none} at=${s_claimed_at_s:-none}s; pid $s_pid_start -> $s_pid_end)"
   if [ "$est2" = "connected" ]; then s_completed="1"; else s_completed="0"; fi
   if [ "$s_pid_start" != "$s_pid_end" ] || [ -z "$s_pid_end" ]; then
     s_cell="FAIL"; s_fail_step="process"; log "vr12s: FAIL step=process — pid changed ($s_pid_start -> $s_pid_end)"; return
   fi
   if [ "$s_claimed" = "1" ]; then
     s_cell="FAIL"; s_fail_step="reconciler-claim"
-    log "vr12s: FAIL step=reconciler-claim — the spanning resume's reconciler resolved a legitimate in-flight connect at ~${s_claimed_at_s}s post-resume (grace 3s); completion_after_claim=$s_completed"
+    log "vr12s: FAIL step=reconciler-claim — the spanning resume's reconciler resolved a legitimate in-flight connect at +${s_claimed_at_s}s post-resume (form=$s_claim_form, grace 3s); completion_after_claim=$s_completed"
     return
   fi
   if [ "$s_completed" != "1" ]; then
-    s_cell="FAIL"; s_fail_step="completion"; log "vr12s: FAIL step=completion — never claimed, but the request did not complete after approval (end state=$est2)"; return
+    # Keep the prongs distinct: a consumption failure (the wire
+    # signature incomplete — the paused-WebView delivery question)
+    # is NOT a completion failure of the client's session flow,
+    # and neither is a claim. Name exactly which markers were
+    # present and which were absent.
+    if [ "$s_consumption" != "1/1/1" ]; then
+      s_cell="FAIL"; s_fail_step="completion-consumption"
+      log "vr12s: FAIL step=completion-consumption — never claimed, approved, but the consumption signature is INCOMPLETE ($s_consumption = authorize/receipt/app-close): the connect's wire completion did not fully land in the client (end state=$est2). Prong kept distinct from reconciler-claim and from completion."
+    else
+      s_cell="FAIL"; s_fail_step="completion"
+      log "vr12s: FAIL step=completion — never claimed and the wire consumption signature is COMPLETE (1/1/1), but the client's session flow never reached Connected in 60s (end state=$est2, sheets=$s_sheets approvals=$s_appr)"
+    fi
+    return
   fi
   s_cell="PASS"
-  log "vr12s: PASS — the in-flight connect survived the spanning resume unclaimed and completed on its own terms"
+  log "vr12s: PASS — the in-flight connect survived the spanning resume unclaimed (full grace window, wire-observed) and completed on its own terms (consumption=$s_consumption)"
 }
 
+start_stream
 cell_vr12r
 capture_window "final"
 cell_vr12s
 capture_window "s-final"
+stop_stream
 
 # --- verdict -----------------------------------------------------------------
 if [ "$cell" = "PASS" ] && { [ "$fatal_pkg_total" -gt 0 ] || [ "$fatal_mock_total" -gt 0 ] || [ "$ise_total" -gt 0 ]; }; then
@@ -883,8 +1261,18 @@ fi
 {
   echo "cell=$cell"
   [ -n "$fail_step" ] && echo "fail_step=$fail_step"
+  echo "driver=r4"
   echo "resolution_s=$resolution_s"
   echo "resolution_form=$resolution_form"
+  echo "resolution_path=$resolution_path"
+  echo "claim_gen=$claim_gen"
+  echo "claim_delivery_offset_s=$claim_delivery_offset_s"
+  echo "claim_exercised=$claim_exercised"
+  echo "retry_budget_s=$retry_budget_s"
+  echo "retry_scenarios=$retry_scenarios"
+  echo "retry_attempts=$retry_attempts"
+  echo "retry_sheet_attempt=$sheet_attempt"
+  echo "zombie_death_offset_s=$zombie_death_offset_s"
   echo "retry_to_connected_s=$retry_to_connected_s"
   echo "sheets_after_retry=$sheets_after_retry"
   echo "approvals=$approvals"
@@ -901,6 +1289,9 @@ fi
   [ -n "$s_fail_step" ] && echo "leg_vr12s_fail_step=$s_fail_step"
   echo "leg_vr12s_claimed=$s_claimed"
   echo "leg_vr12s_claimed_at_s=$s_claimed_at_s"
+  echo "leg_vr12s_claim_form=$s_claim_form"
+  echo "leg_vr12s_consumption=$s_consumption"
+  echo "leg_vr12s_sheets=$s_sign_sheets"
   echo "leg_vr12s_completed=$s_completed"
   echo "leg_vr12s_pid_start=$s_pid_start"
   echo "leg_vr12s_pid_end=$s_pid_end"

@@ -37,38 +37,54 @@ devnet/test identity only).
 4. **Abandon**: HOME, then return to the **Zert** task via recents
    without approving. Zert's `MainActivity.onResume` fires the
    foreground reconciler.
-5. **Resolution**: within 40 s the client must leave `Connecting…`
-   — any failed-closed form counts (the abandonment access message
-   *THE WALLET REQUEST WAS ABANDONED BEFORE IT FINISHED. TRY
-   AGAIN.*, or a clean return to the disconnected lobby with no
-   message — the form run 1 actually produced; the driver records
-   the per-poll trajectory and which form occurred). Only
-   Working-persistence — the vr12 hang — fails this step; the
-   retry leg proceeds from any failed-closed resolution.
+5. **Resolution** (r4: wire-graded): the reconciler's claim must
+   DELIVER. Since v0.1.7 the claim settles the gen-1 JS request at
+   claim time and logs `claim-delivery requestId=… gen=…` (tag
+   `ZertGoblinWallet`); that marker landing inside the post-resume
+   grace window (allowance 25 s: 3 s grace + the battery's
+   3.0–3.2 s delivery anchor + skew margin) proves the step. If
+   the zombie unwinds before the claim can fire, resolution is
+   recorded as delivered-via-unwind (`resolution_path=unwind`,
+   claim sub-criterion not exercised) and the leg proceeds.
+   Absent both within 40 s → `fail_step=resolution-delivery`. The
+   DOM trajectory is still dumped per poll as evidence; it never
+   gates (the deployed lobby renders no in-flight state, so a DOM
+   poll cannot discriminate a claim from a client-side reset —
+   VR12R_CELL_V016 §3).
 6. **Retry**: tap the connect control **once**, then an approval
    loop (HAUNT r6 form): approve every sheet the retry produces —
    the authorize sheet, then Zert's sign-proof sheet (its session
    flow signs a server nonce immediately after connect) — for up
-   to **110 s** from the tap.
+   to **150 s** from the tap (r4 budget; derivation below).
 7. **PASS** requires, all in one process (app pid identical at
-   start and end; the driver never force-stops the app): a sheet
-   presented after the retry tap **and** ≥1 approval **and** the
-   session state reached inside the 110 s budget. Any FAIL names
-   its step (`lobby`, `first-sheet`, `resolution`, `retry-sheet`,
-   `retry-approval`, `retry-connect`, `process`, `crash-scan`, …).
+   start and end; the driver never force-stops the app): the
+   in-window claim-delivery (or the recorded unwind path) **and**
+   a fresh association scenario on the wire after the tap
+   (`retry-scenario`) **and** — on the claim path, where the
+   claim arms the refire loop — ≥1 loop attempt line
+   (`retry-attempt`) **and** a sheet presented after the tap
+   **and** ≥1 approval **and** the session state reached inside
+   the budget. Any FAIL names its step (`lobby`, `first-sheet`,
+   `resolution-delivery`, `retry-scenario`, `retry-attempt`,
+   `retry-sheet`, `retry-approval`, `retry-connect`, `process`,
+   `crash-scan`, …).
 
 Windows, stated once: sheet waits 45 s (HAUNT parity); resolution
-40 s (the reconciler's own grace is 3 s; the rest is render +
-poll margin); retry budget **110 s** from the retry tap (HAUNT r6
-parity — the same budget HAUNT's vr12r verdicts were graded
-against). The association itself is expected to establish in the
-~30 s class; the lane log's timestamps (`retry_to_connected_s` in
-`verdict.txt`) let a reader grade that separately. On v0.1.5's
-shape (no refire loop — the retry's single re-fired intent is the
-whole attempt), a swallowed intent presents as: possibly the
-zombie sheet surfacing and being approved to no effect, then no
-Connected inside the budget (`fail_step=retry-connect` or
-`retry-sheet`).
+40 s (the reconciler's own grace is 3 s; the claim allowance
+inside it is 25 s); retry budget **150 s** from the retry tap —
+r4 derives it from the loop's own arithmetic (3 attempts × 35 s
+slots + 2 × 0.5 s refire gaps = 106 s worst case, plus ~44 s for
+two approvals and the session flow), superseding r3's 110 s HAUNT
+parity figure, which could bind against a working loop on
+attempt 3. The association itself is expected to establish in
+the ~30 s class; `verdict.txt` carries the per-attempt topology
+(scenario epochs, attempt lines, zombie-death offset, which
+attempt's sheet landed) so a reader can grade timing separately.
+On v0.1.5's shape (no refire loop — the retry's single re-fired
+intent is the whole attempt), a swallowed intent presents as:
+possibly the zombie sheet surfacing and being approved to no
+effect, then no Connected inside the budget
+(`fail_step=retry-connect` or `retry-sheet`).
 
 ## The second leg — vr12s (reconciler scoping)
 
@@ -80,14 +96,19 @@ that spans a later background→resume cycle can be claimed and
 resolved as if abandoned. The leg: fresh state (`pm clear`; pid
 continuity is asserted within the leg) → tap Connect → sheet in
 flight → HOME → return to **Zert** while the sheet is still
-unanswered → poll 14 s across the 3 s grace (the request must
-stay `Connecting…` the whole window; any failed-closed form =
-claimed, with the post-resume second recorded) → surface the
-wallet task (am start on the singleTask sheet activity, stack
-move-task, recents tap — in that order) → approve authorize +
-sign → Connected within 60 s. **PASS requires both**: never
-claimed AND completed on its own terms, same process. Verdict
-lines are the `leg_vr12s_*` keys in `verdict.txt`.
+unanswered → observe the FULL 14 s grace window (r4: **wire
+markers, no early break** — claimed = an in-window
+`claim-delivery` marker, which can only target the spanning
+connect as the sole live bridge request, or the spanning
+scenario's wire signature breaking; DOM polls are filed as
+evidence only) → surface the wallet task (am start on the
+singleTask sheet activity, stack move-task, recents tap — in
+that order) → approve authorize + sign → consumption signature
+on the wire + Connected within 60 s. **PASS requires both**:
+never claimed AND completed on its own terms, same process.
+Claim and consumption failures are distinct steps
+(`reconciler-claim` vs `completion-consumption`/`completion`).
+Verdict lines are the `leg_vr12s_*` keys in `verdict.txt`.
 
 Run history note (driver r3): r1's resolution gate demanded the
 access-message form and stopped before the retry; r2 recorded the
@@ -100,15 +121,47 @@ markers (`WALLET CONNECTED` banner / `Insert coin…` launch
 button), the approval loop is wall-clock bounded and
 foreground-directed, and the vr12s leg runs in the same suite.
 
+Run history note (driver r4): the v0.1.6 run (41039724494)
+proved the DOM detector cannot grade these legs on this client
+at all — vr12s's "claimed at 0 s" was temporally impossible and
+its own logcat showed the spanning connect completing unclaimed;
+vr12r's resolution phase could not discriminate a shell claim
+from a client-side attempt reset. r4 moves every grade to wire
+markers (see below), keeps DOM for driving the cell and for the
+final Connected criterion only, spans the full vr12s grace
+window with no early break, raises the retry budget to 150 s
+from the loop's arithmetic, and adds the claim-delivery
+resolution gate the v0.1.7 bridge-settlement strike makes
+observable. The r4 marker helpers were validated offline against
+the v0.1.6 run's filed logcat before dispatch (consumption
+signature, zombie-death epoch, and scenario epochs reproduce
+that run's hand-read wire facts exactly, and the vr12s grace
+query returns no false wire-break on its window).
+
 ## Observation surfaces — and their limits
 
-- **Hierarchy dumps** (uiautomator). Zert's state is its WebView
-  DOM: `Connecting…` (working), the abandonment access message
-  (resolved-error), and — for the session state — the lobby
-  banner `WALLET CONNECTED` with the launch button reading
-  `Insert coin…` (r3; the DOM `Disconnect wallet` button is
-  below the fold and not in the viewport accessibility tree —
-  its presence is accepted as an alternative marker only).
+- **Wire markers (primary since r4).** A continuous
+  `adb logcat -v epoch` stream (`logcat-stream.txt` in the
+  evidence) is queried at every decision point, so ring-buffer
+  rotation no longer bounds the record. Scenario creation
+  (`LocalAssociationScenario: Creating local association
+  scenario`, app pid) = an attempt fired; the loop's attempt
+  lines and the bridge's `claim-delivery` lines (tag
+  `ZertGoblinWallet`) = the shell's own account of refires and
+  claim settlements; mock-side authorize completion + app-side
+  JSON-RPC receipt + app-initiated websocket close on a
+  different tid within ~1–3 s = consumption; a scenario
+  disconnect with no receipt in the preceding seconds, or the
+  mock-side `authorization request declined`, = an unreceipted
+  (zombie) death.
+- **Hierarchy dumps** (uiautomator) drive the cell (taps, sheet
+  presence via foreground package + controls) and carry the one
+  remaining DOM grade: the session state — the lobby banner
+  `WALLET CONNECTED` with the launch button reading
+  `Insert coin…` (the DOM `Disconnect wallet` button is below
+  the fold and not in the viewport accessibility tree — its
+  presence is accepted as an alternative marker only). Every
+  other DOM poll is filed evidence, never a gate.
 - **The pubkey is never rendered by Zert's client.** The session
   grade is nonetheless key-bound: a session exists only after the
   MWA connect returned the mock key's pubkey, the mock signed the
@@ -121,10 +174,13 @@ foreground-directed, and the vr12s leg runs in the same suite.
   or an ActivityResultSender-signature IllegalStateException
   poisons the verdict (`crash-scan`), per HAUNT's scan rule.
 - A sheet appearing after the retry tap is graded as *presented*;
-  the driver cannot attribute it internally to the retry's
-  association vs the zombie's — the same limit HAUNT's r6 driver
-  carries, and the reason the loop approves whatever appears and
-  grades only the terminal state.
+  r4 attributes it to an attempt by timing (the latest scenario
+  created before the sheet was first observed), but the driver
+  cannot prove the attribution internally — a resurfaced zombie
+  sheet would wear the same timing. The loop therefore approves
+  whatever appears and the verdict rests on the terminal state
+  plus the attempt/scenario accounting, the same posture as
+  HAUNT's r6 driver.
 
 **Scope.** The verdict binds to the Mock MWA Wallet's intent
 handling: its `MobileWalletAdapterActivity` is `singleTask` in a
@@ -146,11 +202,11 @@ gh workflow run zert-vr12r.yml -R raaruofficial/zert-goblin \
   -f api_level=35
 ```
 
-Defaults already point at the sealed v0.1.5 artefact
-(12965581620 / `f7bc4705…4800`). Evidence lands as the
-`zert-vr12r-api<level>` artifact of the run: `verdict.txt`, the
-timestamped lane log, hierarchy dumps + screenshots at every
-decision point, and scanned logcat windows.
+Defaults point at the sealed v0.1.7 artefact (12972776870 /
+`f5543401…6d9`). Evidence lands as the `zert-vr12r-api<level>`
+artifact of the run: `verdict.txt`, the timestamped lane log,
+the continuous logcat stream, hierarchy dumps + screenshots at
+every decision point, and scanned logcat windows.
 
 **Locally** (driver only — needs a booted emulator/device on adb
 with KVM or hardware acceleration to mean anything; this VM's
