@@ -1,0 +1,54 @@
+name: Zert vr12r cell (KFC-008 retry leg)
+
+# Runtime vr12r-pattern cell for the KFC-008 retry leg, per the
+# JUDGE/main directive of 2026-10-30: Zert's battery #4 closed the
+# retry at JVM grade against a fake whose association axioms HAUNT's
+# v0.1.17 runtime verdict disproved (the operative mechanism is the
+# wallet's single-task intent handler swallowing the retry's
+# association intent while the zombie sheet is in flight). The bar
+# is UNMET until this cell passes against the real Mock MWA Wallet.
+#
+# Defaults target the sealed v0.1.5 candidate (Android CI run
+# 41029854434, artefact 12965581620, sha256 f7bc4705...4800).
+# To grade another build, pass its artifact id + sha256.
+# A workflow_dispatch file must exist on the DEFAULT branch to run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_artifact_id:
+        description: Artifact id (this repo) holding the target release APK
+        type: string
+        default: "12965581620"
+      expected_sha256:
+        description: sha256 gate for the target APK
+        type: string
+        default: "f7bc47056743ac86caa56037147d69fee07d8899c8c31a1c54ff5a64dda64800"
+      api_level:
+        description: Emulator API level
+        type: choice
+        options:
+          - "35"
+          - "36"
+        default: "35"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  vr12r:
+    name: vr12r cell — API ${{ inputs.api_level }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/vr12r-suite
+        with:
+          api-level: ${{ inputs.api_level }}
+          avd-name: zert${{ inputs.api_level }}-vr12r
+          apk-artifact-id: ${{ inputs.apk_artifact_id }}
+          expected-sha256: ${{ inputs.expected_sha256 }}
+          expected-pubkey: FnAA1CURUQevWmasFAjEMXWLGbq9dnEqSysg8Ho9Z2nH
+          mock-private-key: ${{ secrets.MOCK_WALLET_PRIVATE_KEY }}
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
