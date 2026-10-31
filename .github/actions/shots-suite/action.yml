@@ -1,0 +1,138 @@
+name: Zert shots-suite job
+description: >-
+  One run of the portal screenshot capture:
+  builds the pinned Mock MWA Wallet from source, boots a PIN-locked
+  AVD on the CI-KVM lane, downloads the target sealed artefact behind
+  a sha256 gate, and runs tools/capture-screenshots.sh against it. Port of
+  the estate §2.2 recipe as HAUNT's wallet-suite action implements it.
+
+inputs:
+  api-level:
+    required: true
+  avd-name:
+    required: true
+  apk-artifact-id:
+    required: true
+    description: GitHub Actions artifact id (this repo) holding the target release APK
+  expected-sha256:
+    required: true
+    description: sha256 the downloaded APK must match before any install
+  expected-pubkey:
+    required: true
+    description: Base58 pubkey of the throwaway mock key (public anchor)
+  mock-private-key:
+    required: true
+    description: Throwaway devnet-only Ed25519 seed for the mock wallet
+  gh-token:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Enable KVM group permissions
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        ls -la /dev/kvm
+
+    - name: Install emulator runtime libraries
+      shell: bash
+      run: |
+        # Emulator qemu links libpulse.so.0, which some ubuntu-latest
+        # draws lack — the process dies at load and the action then
+        # burns its whole boot timeout polling adb (VR lane lesson).
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libpulse0 libgl1 libegl1 libnss3 libxcb-cursor0 > /dev/null
+        ldconfig -p | grep -c libpulse || true
+
+    - name: Set up JDK 17 (mock wallet build)
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "17"
+
+    - name: Download target artefact + hash gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        ARTIFACT_ID: ${{ inputs.apk-artifact-id }}
+        EXPECTED_SHA256: ${{ inputs.expected-sha256 }}
+      run: |
+        set -euo pipefail
+        gh api "repos/raaruofficial/zert-goblin/actions/artifacts/${ARTIFACT_ID}/zip" > /tmp/target-artefact.zip
+        mkdir -p /tmp/target-artefact
+        unzip -o /tmp/target-artefact.zip -d /tmp/target-artefact
+        apk="$(find /tmp/target-artefact -name '*.apk' | head -n 1)"
+        cp "$apk" "$GITHUB_WORKSPACE/zert-target.apk"
+        actual="$(sha256sum "$GITHUB_WORKSPACE/zert-target.apk" | awk '{print $1}')"
+        echo "target APK sha256: $actual"
+        if [ "$actual" != "$EXPECTED_SHA256" ]; then
+          echo "::error::Target APK hash mismatch — aborting before any run"
+          exit 1
+        fi
+
+    - name: Clone Mock MWA Wallet at pinned commit
+      shell: bash
+      env:
+        MOCK_COMMIT: d444aff0c72dadd0f5c442ea2bc3559b62916e01
+      run: |
+        set -euo pipefail
+        git clone https://github.com/solana-mobile/mock-mwa-wallet "$GITHUB_WORKSPACE/mock-src"
+        cd "$GITHUB_WORKSPACE/mock-src"
+        git checkout "$MOCK_COMMIT"
+        git rev-parse HEAD
+
+    - name: Gradle cache (mock wallet)
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: mock-gradle-d444aff0-${{ runner.os }}
+
+    - name: Configure + build mock wallet (imported throwaway key)
+      shell: bash
+      env:
+        MOCK_PK: ${{ inputs.mock-private-key }}
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE/mock-src"
+        {
+          printf 'privateKey=%s\n' "$MOCK_PK"
+          printf 'walletName=%s\n' "ZertTestWallet"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME"
+        } > local.properties
+        chmod +x gradlew
+        ./gradlew :app:assembleDebug --console=plain --no-daemon 2>&1 | tail -n 25
+        ls -la app/build/outputs/apk/debug/app-debug.apk
+
+    - name: Run screenshot capture on PIN-locked AVD (API ${{ inputs.api-level }})
+      uses: reactivecircus/android-emulator-runner@v2
+      env:
+        SHOTS_OUT: zert-screenshots
+        ZERT_APK: ${{ github.workspace }}/zert-target.apk
+        MOCK_APK: ${{ github.workspace }}/mock-src/app/build/outputs/apk/debug/app-debug.apk
+        EXPECTED_PUBKEY: ${{ inputs.expected-pubkey }}
+        DEVICE_PIN: "1234"
+      with:
+        api-level: ${{ inputs.api-level }}
+        target: google_apis
+        arch: x86_64
+        profile: pixel_7_pro
+        avd-name: ${{ inputs.avd-name }}
+        force-avd-creation: true
+        emulator-boot-timeout: 1200
+        ram-size: 8192
+        disable-animations: true
+        emulator-options: -no-window -gpu swiftshader_indirect -memory 8192 -no-boot-anim -camera-back none -camera-front none
+        script: bash tools/capture-screenshots.sh
+
+    - name: Upload screenshot evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zert-screenshots-api${{ inputs.api-level }}
+        path: zert-screenshots
+        if-no-files-found: warn

@@ -1,0 +1,58 @@
+name: Zert portal screenshots
+
+# Portal screenshot capture for the dApp Store listing (dApp
+# Preview set), per package/kit/SCREENSHOT_PLAN.md. Installs the
+# hash-gated target APK + the pinned Mock MWA Wallet on the CI-KVM
+# lane and runs tools/capture-screenshots.sh: lobby -> Mock session
+# -> live Classic run -> Goblin Mode -> leaderboard -> skin store,
+# PNGs at 824x1830 (viewport 412x915 @2x, the estate set of record).
+#
+# RUN ONLY after the Connect redeploy is verified (the live host
+# serves index 73c15cb0 / JS 5b860bbd / CSS 3b0374f3): the frames
+# must show the shipped product — v0.1.7 + the Connect client —
+# never the pre-Connect bundle.
+#
+# Defaults target the sealed v0.1.7 candidate (Android CI run
+# 41046425847, artefact 12972776870, sha256 f5543401...6d9).
+# To shoot another build, pass its artifact id + sha256.
+# A workflow_dispatch file must exist on the DEFAULT branch to run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_artifact_id:
+        description: Artifact id (this repo) holding the target release APK
+        type: string
+        default: "12972776870"
+      expected_sha256:
+        description: sha256 gate for the target APK
+        type: string
+        default: "f554340116767da6a9bc6aeb474f343333c322ddcac7770d1cc32e59c642b6d9"
+      api_level:
+        description: Emulator API level
+        type: choice
+        options:
+          - "35"
+          - "36"
+        default: "35"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  screenshots:
+    name: portal screenshots — API ${{ inputs.api_level }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/shots-suite
+        with:
+          api-level: ${{ inputs.api_level }}
+          avd-name: zert${{ inputs.api_level }}-shots
+          apk-artifact-id: ${{ inputs.apk_artifact_id }}
+          expected-sha256: ${{ inputs.expected_sha256 }}
+          expected-pubkey: FnAA1CURUQevWmasFAjEMXWLGbq9dnEqSysg8Ho9Z2nH
+          mock-private-key: ${{ secrets.MOCK_WALLET_PRIVATE_KEY }}
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
