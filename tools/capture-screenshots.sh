@@ -14,9 +14,20 @@
 # Kingdom working set (package/screenshots/README.md) defines that
 # as viewport 412x915 @2x, i.e. 824x1830 px files. The AVD is forced
 # to exactly that raster (wm size 824x1830, wm density 320 = logical
-# 412x915 dp) before any app launches, and every saved PNG's IHDR is
-# verified against 824x1830; an off-size file is flagged in the
-# manifest, never silently passed.
+# 412x915 dp), and every saved PNG's IHDR is verified against
+# 824x1830; an off-size file is flagged in the manifest, never
+# silently passed.
+#
+# DRIVER r2 (run-1 fix): run 1 applied the wm override immediately
+# after boot, BEFORE any app launched and before the first dump —
+# and `uiautomator dump` then failed on every call from the first
+# one (0 of 7 shots). The sibling vr12r driver never overrides
+# geometry and read dumps fine all evening on the identical AVD
+# config. The override therefore now lands AFTER the mock-wallet
+# security/auth phase and BEFORE the target app installs, bracketed
+# by dump_ui probes (probe 1 on the untouched post-boot device,
+# probe 2 immediately after the override) that fail the lane fast
+# with manifest rows written, instead of at minute ~50.
 #
 # TRUTH RULE (portal + estate): screenshots must be real captures of
 # the SUBMISSION build (LAUNCH_QUEUE portal pass, 2026-10-26:
@@ -111,7 +122,8 @@ mkdir -p "$OUT"
 : > "$MANIFEST"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LANE_LOG"; }
 
-shots_ok="0"; shots_missing=""
+shots_ok="0"; shots_missing=""; recorded=""
+ALL_FRAMES="01-lobby.png 02-connected.png 03-mode-select.png 04-gameplay.png 05-goblin-mode.png 06-leaderboard.png 07-skin-store.png"
 fatal_pkg_total="0"; fatal_mock_total="0"; ise_total="0"
 lock_pin="unknown"; lock_fp="unknown"; auth_note="not attempted"
 door_form="unknown"; board_state="unknown"; goblin_confirm="not-run"
@@ -267,6 +279,7 @@ PY
 
 shot() { # $1 = filename, $2 = marker note -> screencap + manifest row
   local name="$1" note="$2" dims sha
+  recorded="$recorded $name"
   adb exec-out screencap -p > "$OUT/$name" 2>/dev/null || true
   dims="$(png_dims "$OUT/$name")"
   sha="$(sha256sum "$OUT/$name" 2>/dev/null | awk '{print $1}')"
@@ -278,24 +291,31 @@ shot() { # $1 = filename, $2 = marker note -> screencap + manifest row
 }
 
 miss() { # $1 = filename, $2 = reason
+  recorded="$recorded $1"
   echo "$1 | MISSING | $2" >> "$MANIFEST"
   shots_missing="$shots_missing $1"
   log "shot MISSING: $1 — $2"
 }
 
-# --- device record + portal geometry ------------------------------------
+miss_all() { # $1 = reason; MISSING rows for every frame not yet recorded
+  # Manifest discipline (run-1 bug #2): every exit path — probe
+  # failures and early aborts included — leaves an explicit row for
+  # every frame, never a silent gap or an empty manifest.
+  local reason="$1" s
+  for s in $ALL_FRAMES; do
+    case " $recorded " in
+      *" $s "*) ;;
+      *) miss "$s" "$reason" ;;
+    esac
+  done
+}
+
+# --- device record -------------------------------------------------------
 adb wait-for-device
 for _ in $(seq 1 60); do
   [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
   sleep 5
 done
-# Portal raster: 824x1830 px = viewport 412x915 @2x (estate set of
-# record). Force BEFORE any app launches; verify by screencap IHDR.
-adb shell wm size ${WANT_W}x${WANT_H} >/dev/null 2>&1 || true
-adb shell wm density 320 >/dev/null 2>&1 || true
-sleep 2
-adb exec-out screencap -p > "$TMPD/geom-check.png" 2>/dev/null || true
-GEOM="$(png_dims "$TMPD/geom-check.png")"
 {
   echo "sdk=$(adb shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r')"
   echo "release=$(adb shell getprop ro.build.version.release 2>/dev/null | tr -d '\r')"
@@ -304,12 +324,23 @@ GEOM="$(png_dims "$TMPD/geom-check.png")"
   echo "suite=screenshots"
   echo "expected_pubkey=$EXPECTED_PUBKEY"
   echo "zert_apk=$ZERT_APK"
-  echo "wm_size=$(adb shell wm size 2>/dev/null | tr -d '\r' | head -n 1)"
-  echo "wm_density=$(adb shell wm density 2>/dev/null | tr -d '\r' | head -n 1)"
-  echo "screencap_dims=$GEOM (wanted ${WANT_W}x${WANT_H})"
 } > "$OUT/device-info.txt"
 cat "$OUT/device-info.txt" | tee -a "$LANE_LOG"
-[ "$GEOM" = "${WANT_W}x${WANT_H}" ] || log "geometry: WARNING — screencap is $GEOM, not ${WANT_W}x${WANT_H}; shots will be flagged OFF-SPEC in the manifest"
+
+# --- dump probe 1 (driver r2): prove the dump primitive on the
+# untouched post-boot device, BEFORE any geometry override. Run 1's
+# uiautomator dump failed on every call from the first one and the
+# failure only surfaced ~50 minutes in; a dead primitive now fails
+# the lane in the first minutes, manifest rows written.
+if dump_ui "$TMPD/probe-boot.xml"; then
+  log "probe1: dump_ui OK on post-boot device (pre-geometry)"
+  cp "$TMPD/probe-boot.xml" "$OUT/hier-probe-boot.xml" || true
+else
+  log "probe1: dump_ui DEAD on post-boot device (pre-geometry) — failing fast"
+  miss_all "dump primitive dead at post-boot probe (pre-geometry)"
+  echo "shots=FAIL(step=dump-probe-boot)" > "$OUT/verdict.txt"
+  exit 1
+fi
 
 # --- PIN lock + fingerprint enrollment (binding recipe step 2) ---------
 log "security: setting device PIN via locksettings"
@@ -416,6 +447,7 @@ log "install: mock wallet ($MOCK_APK)"
 if ! adb install "$MOCK_APK" > "$TMPD/install-mock.log" 2>&1; then
   cat "$TMPD/install-mock.log" | tee -a "$LANE_LOG"
   log "install: MOCK INSTALL FAILED — no wallet states can be captured"
+  miss_all "mock wallet install failed — walk never started"
   echo "shots=FAIL(step=mock-install)" > "$OUT/verdict.txt"
   exit 1
 fi
@@ -500,11 +532,42 @@ auth_fresh_enough() {
 }
 
 authenticate_mock || true
+
+# --- portal geometry (driver r2): applied AFTER the mock security/
+# auth phase, BEFORE the target app installs/launches (the target
+# app's captures are the only frames that need the raster). Run 1
+# applied this immediately after boot and every dump died; the
+# sibling vr12r driver never overrides geometry at all. Bracketed
+# by dump probe 2.
+log "geometry: applying portal raster ${WANT_W}x${WANT_H} (wm size + density 320)"
+adb shell wm size ${WANT_W}x${WANT_H} >/dev/null 2>&1 || true
+adb shell wm density 320 >/dev/null 2>&1 || true
+sleep 2
+adb exec-out screencap -p > "$TMPD/geom-check.png" 2>/dev/null || true
+GEOM="$(png_dims "$TMPD/geom-check.png")"
+{
+  echo "wm_size=$(adb shell wm size 2>/dev/null | tr -d '\r' | head -n 1)"
+  echo "wm_density=$(adb shell wm density 2>/dev/null | tr -d '\r' | head -n 1)"
+  echo "screencap_dims=$GEOM (wanted ${WANT_W}x${WANT_H})"
+} >> "$OUT/device-info.txt"
+log "geometry: wm_size=$(adb shell wm size 2>/dev/null | tr -d '\r' | head -n 1) screencap_dims=$GEOM (wanted ${WANT_W}x${WANT_H})"
+[ "$GEOM" = "${WANT_W}x${WANT_H}" ] || log "geometry: WARNING — screencap is $GEOM, not ${WANT_W}x${WANT_H}; shots will be flagged OFF-SPEC in the manifest"
+if dump_ui "$TMPD/probe-geom.xml"; then
+  log "probe2: dump_ui OK after geometry override"
+  cp "$TMPD/probe-geom.xml" "$OUT/hier-probe-geometry.xml" || true
+else
+  log "probe2: dump_ui DEAD after geometry override — failing fast"
+  miss_all "dump primitive died after the wm geometry override"
+  echo "shots=FAIL(step=dump-probe-geometry)" > "$OUT/verdict.txt"
+  exit 1
+fi
+
 log "install: target Zert APK ($ZERT_APK)"
 adb uninstall "$PKG" >/dev/null 2>&1 || true
 if ! adb install "$ZERT_APK" > "$TMPD/install-zert.log" 2>&1; then
   cat "$TMPD/install-zert.log" | tee -a "$LANE_LOG"
   log "install: ZERT INSTALL FAILED"
+  miss_all "target APK install failed — walk never started"
   echo "shots=FAIL(step=app-install)" > "$OUT/verdict.txt"
   exit 1
 fi
@@ -699,6 +762,7 @@ log "=== screenshot walk: lobby -> connect -> run -> board -> store ==="
 auth_fresh_enough
 if ! goto_lobby; then
   log "walk: could not reach the lobby — no shots possible"
+  miss_all "could not reach the lobby"
   echo "shots=FAIL(step=lobby)" > "$OUT/verdict.txt"
   exit 1
 fi
@@ -706,6 +770,7 @@ st="$(zert_state "$OUT/hier-lobby.xml")"
 log "walk: lobby state=$st"
 if [ "$st" != "disconnected" ]; then
   log "walk: FAIL — fresh install lobby state=$st, expected disconnected"
+  miss_all "fresh-install lobby was not in the disconnected state (state=$st)"
   echo "shots=FAIL(step=precondition)" > "$OUT/verdict.txt"
   exit 1
 fi
@@ -847,9 +912,15 @@ if [ -f "$OUT/01-lobby.png" ]; then
   else
     miss "07-skin-store.png" "the SKINS control never opened the store"
   fi
+else
+  miss "07-skin-store.png" "not attempted (walk ended before a lobby frame existed)"
 fi
 
 # --- crash scan + verdict ---------------------------------------------------
+# Manifest safety net (driver r2): any frame the walk never recorded
+# (e.g. the leaderboard block is skipped when no run confirmed) gets
+# an explicit MISSING row here — silence is the bug, not the gap.
+miss_all "walk ended without recording this frame (safety-net row)"
 adb logcat -d > "$OUT/logcat-final.txt" 2>&1 || true
 scan_logcat "$OUT/logcat-final.txt"
 {
