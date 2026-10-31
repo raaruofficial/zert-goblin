@@ -49,6 +49,6 @@ jobs:
           avd-name: zert${{ inputs.api_level }}-vr12r
           apk-artifact-id: ${{ inputs.apk_artifact_id }}
           expected-sha256: ${{ inputs.expected_sha256 }}
-          expected-pubkey: FnAA1CURUQevWmasFAjEMXWLGbq9dnEqSysg8Ho9Z2nH
+          expected-pubkey: 3vqmsuE8vi4X4oW9WQ2LkGsVYnzs9fbKLsrfVkXPx2iN
           mock-private-key: ${{ secrets.MOCK_WALLET_PRIVATE_KEY }}
           gh-token: ${{ secrets.GITHUB_TOKEN }}
