@@ -29,8 +29,8 @@ jobs:
       - name: Download run-6 artifact (cross-run)
         uses: actions/download-artifact@v4
         with:
-          name: zert-screenshots-api35
           run-id: 41161361026
+          merge-multiple: true
           path: artifact-dl
 
       - name: Inspect artifact contents (fail loudly if the evidence core is absent)
