@@ -12,6 +12,13 @@ name: Publish run-6 screenshots to git (one-off)
 # the frames then travel to the workspace via ordinary git.
 # This file is removed in a tidy commit once retrieval is done;
 # the trail lives in SCREENSHOT_RUN.md.
+#
+# Shape note: this replicates the run-5 bridge (edea800) EXACTLY
+# (name + run-id + explicit github-token) — that configuration
+# provably fetched the run-5 artifact. Variants tried for run 6
+# (default token; no-name merge-multiple; artifact-ids) all failed
+# to see the artifact ("Bad credentials" / "not found" / "Found
+# 0") even though the REST API lists it.
 
 on:
   workflow_dispatch:
@@ -29,7 +36,9 @@ jobs:
       - name: Download run-6 artifact (cross-run)
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: 13027491588
+          name: zert-screenshots-api35
+          run-id: 41161361026
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           path: artifact-dl
 
       - name: Inspect artifact contents (fail loudly if the evidence core is absent)
