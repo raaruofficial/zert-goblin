@@ -18,6 +18,20 @@
 # 824x1830; an off-size file is flagged in the manifest, never
 # silently passed.
 #
+# DRIVER r3 (run-2 fix): run 2's lane ran clean (both probes green)
+# but the walk aborted at connect detection — zert_state keyed on
+# the literal "WALLET CONNECTED", which in the Connect client is a
+# transient access-message toast (App.tsx:1474), while the session
+# HAD established by wire record (authorize + sign-proof consumed).
+# The persistent live-session marker is the launch control in its
+# session form (App.tsx:1715 ternary — see zert_state). r3: (1) the
+# detector grades "connected" on that persistent form, toast demoted
+# to corroboration; (2) failure-path poll dumps are persisted into
+# the evidence artifact (run 2's decisive $TMPD dumps were lost);
+# (3) the connect-abort branches no longer pre-miss frame 07 — the
+# store leg records its own outcome, so a frame carries exactly one
+# manifest row (captured XOR missing).
+#
 # DRIVER r2 (run-1 fix): run 1 applied the wm override immediately
 # after boot, BEFORE any app launched and before the first dump —
 # and `uiautomator dump` then failed on every call from the first
@@ -48,8 +62,13 @@
 #                        shell renders it. [claims: cold lobby loads
 #                        with no sign-in; "3 free hunts" door copy C9]
 #   02-connected.png     connected lobby. [a wallet adds a session +
-#                        3 free plays: "WALLET CONNECTED" App.tsx:1474,
-#                        "Insert coin" :1715]
+#                        3 free plays: the launch control in its
+#                        live-session form, "Insert coin · N free
+#                        hunts ready" — App.tsx:1715 ternary on
+#                        walletSession; the disconnected form is
+#                        "Connect wallet · 3 free hunts for new
+#                        wallets". "WALLET CONNECTED" :1474 is a
+#                        transient toast, corroboration only]
 #   03-mode-select.png   difficulty grid. [three modes TRUE: cards
 #                        :1744/:1747/:1750]
 #   04-gameplay.png      Classic run in motion. [four-lane collector,
@@ -574,10 +593,24 @@ fi
 adb logcat -c >/dev/null 2>&1 || true
 
 # --- Zert state surfaces (strings quoted from space/client/src/App.tsx) --
-zert_state() { # $1 = dump file; markers per the vr12r cell's live-client truth
+zert_state() { # $1 = dump file; markers quoted from space/client/src/App.tsx
   local f="$1"
   [ -f "$f" ] || { echo "nodump"; return; }
-  if grep -q "WALLET CONNECTED" "$f" || { grep -q "Disconnect wallet" "$f" && grep -q "Insert coin" "$f"; }; then echo "connected"
+  # "connected" grades on the PERSISTENT session markers (driver r3).
+  # The launch control is a ternary on walletSession (App.tsx:1715):
+  #   !walletSession -> "Connect wallet · 3 free hunts for new wallets"
+  #                     (or "Connecting…" while walletConnecting)
+  #   walletSession  -> "Insert coin · unlimited" (lifetime) |
+  #                     "Insert coin · ${freePlaysLeft} free hunt(s)
+  #                     ready" | "Insert coin · ${paidCredits} ready"
+  #                     | "Buy 4 plays · $1"
+  # So "Insert coin" present AND the disconnected-only "for new
+  # wallets" form absent proves a live session. "WALLET CONNECTED"
+  # (App.tsx:1474) is a transient showAccessMessage toast —
+  # sufficient when seen, never required. Run 2's detector keyed on
+  # that toast (+ "Disconnect wallet") and read "unknown" while the
+  # session stood established by wire record; the walk aborted.
+  if grep -q "WALLET CONNECTED" "$f" || { grep -q "Insert coin" "$f" && ! grep -q "for new wallets" "$f"; }; then echo "connected"
   elif grep -q "ABANDONED BEFORE IT FINISHED" "$f"; then echo "resolved-error"
   elif grep -q "Connecting" "$f"; then echo "working"
   elif grep -q "Connect wallet" "$f"; then echo "disconnected"
@@ -783,12 +816,14 @@ shot "01-lobby.png" "disconnected lobby; door form: $door_form; overline 45 SECO
 # -- connect via the Mock session (cell-proven flow) --
 dump_ui "$TMPD/pre-connect.xml" || true
 if ! tap_text "$TMPD/pre-connect.xml" "Connect wallet"; then
+  cp "$TMPD/pre-connect.xml" "$OUT/hier-pre-connect-fail.xml" || true # r3: persist failure-path dumps
   miss "02-connected.png" "no connect control on the lobby"
   miss "03-mode-select.png" "connect never started"
   miss "04-gameplay.png" "connect never started"
   miss "05-goblin-mode.png" "connect never started"
   miss "06-leaderboard.png" "connect never started (board shot rides the walk's own saved run)"
-  miss "07-skin-store.png" "not attempted (walk aborted at connect)"
+  # 07 NOT pre-missed (r3): the store leg runs independently below
+  # and records its own outcome — one manifest row per frame.
 else
   log "walk: connect tapped; waiting for the mock authorize sheet"
   if ! wait_sheet "$OUT/hier-sheet1.xml" 45; then
@@ -798,10 +833,12 @@ else
     miss "04-gameplay.png" "no session"
     miss "05-goblin-mode.png" "no session"
     miss "06-leaderboard.png" "no session (board shot rides the walk's own saved run)"
-    miss "07-skin-store.png" "not attempted (walk aborted at connect)"
+    # 07 NOT pre-missed (r3): the store leg records its own outcome.
   else
     approve_all_sheets 150 || true
-    # Poll for the session state (banner "WALLET CONNECTED", :1474).
+    # Poll for the session state (persistent markers — zert_state r3:
+    # the launch control in its live-session "Insert coin" form,
+    # App.tsx:1715; the "WALLET CONNECTED" toast :1474 corroborates).
     conn="0"
     for i in $(seq 1 20); do
       if [ "$(fg_pkg)" = "$PKG" ] && dump_ui "$TMPD/conn.xml" && [ "$(zert_state "$TMPD/conn.xml")" = "connected" ]; then conn="1"; break; fi
@@ -809,16 +846,21 @@ else
     done
     if [ "$conn" != "1" ]; then
       log "walk: session never reached Connected (state=$(zert_state "$TMPD/conn.xml"))"
+      # r3: persist the failure-path poll dumps into the artifact —
+      # run 2 lost its decisive $TMPD dumps and the diagnosis had to
+      # be reconstructed from the wire record.
+      cp "$TMPD/conn.xml" "$OUT/hier-connect-fail.xml" || true
+      cp "$TMPD/appr.xml" "$OUT/hier-approve-fail.xml" || true
       miss "02-connected.png" "session never established (sign-proof flow incomplete)"
       miss "03-mode-select.png" "no session"
       miss "04-gameplay.png" "no session"
       miss "05-goblin-mode.png" "no session"
       miss "06-leaderboard.png" "no session (board shot rides the walk's own saved run)"
-      miss "07-skin-store.png" "not attempted (walk aborted at connect)"
+      # 07 NOT pre-missed (r3): the store leg records its own outcome.
     else
       cp "$TMPD/conn.xml" "$OUT/hier-connected.xml" || true
       # -- 02 connected lobby --
-      shot "02-connected.png" "WALLET CONNECTED banner (:1474-1478) + Insert coin launch control (:1715); Mock session (server nonce signed + verified)"
+      shot "02-connected.png" "connected lobby — launch control in live-session form (Insert coin, :1715 ternary; disconnected-only 'for new wallets' form absent); Mock session (server nonce signed + verified)"
       # -- insert coin -> mode select --
       if ! tap_text "$TMPD/conn.xml" "Insert coin"; then
         miss "03-mode-select.png" "no Insert coin control on the connected lobby"
