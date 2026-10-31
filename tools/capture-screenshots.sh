@@ -32,6 +32,36 @@
 # store leg records its own outcome, so a frame carries exactly one
 # manifest row (captured XOR missing).
 #
+# DRIVER r4 (run-3 fix): run 3's detector fix worked end-to-end
+# (02 + 03 captured) but blind play bonked out twice with zero
+# catches observed, and the board shot was never attempted.
+# Three causes, three fixes. (1) MOVEMENT: the primary channel
+# keyed on the arrow buttons' aria-labels (App.tsx:1812/:1816)
+# via node_center on content-desc — it returned empty coords on
+# every play dump, and the "←"/"→" glyph-tap fallback's effect
+# was indeterminable because play-phase dumps lived in $TMPD and
+# were never persisted. r4 steers by the arena's OWN pointer
+# surface instead — the source-proven primary input ("MOVE —
+# Tap a lane", :1726; hint "TAP LANES OR USE ARROWS", :1815):
+# the .arena div's onPointerDown (:1654-1664) teleports Zert to
+# lane floor(x/width*4) of the tap point. Before steering, the
+# driver persists the live play dump + screencap and identifies
+# the arena's bounds from the tree (the first large ancestor of
+# the "{coins} ZEC" topline node, :1668), then taps lane-quarter
+# centers in a 0,1,2,3 cycle, polling the HUD coin counter
+# between sweep cycles to PROVE catches accumulate. The arrow
+# path survives only as a fallback when the live dump proves
+# those nodes exist with bounds AND the arena cannot be
+# identified. (2) PERSISTENCE: every play-phase dump (identify,
+# each poll, goblin confirm, result card) is copied into the
+# evidence artifact on success AND failure paths. (3) BOARD
+# GATE: frame 06 was gated on gameplay_ok || goblin_ok (shot
+# success); it is now gated on a completed run — a result card
+# seen this walk (wait_result_card success or the play loop's
+# own result-card detection) — because a bonked run still saves.
+# Hunt use: up to all 3 free hunts are spent retrying whichever
+# of 04/05 is still missing (run 3's walk stopped at 2).
+#
 # DRIVER r2 (run-1 fix): run 1 applied the wm override immediately
 # after boot, BEFORE any app launched and before the first dump —
 # and `uiautomator dump` then failed on every call from the first
@@ -87,18 +117,28 @@
 #                        deal flag :856, per-skin "$2.50" grid :876ff]
 #
 # PLAYING THE GAME BLIND (honest mechanics): falling entities are
-# aria-hidden (App.tsx:1672-1683) — no driver can see them. The
-# driver moves Zert with the client's own arrow controls
-# (aria-labels "Move Zert left"/"Move Zert right", :1812/:1816) in
-# sweeps and reads the results off the tree (arena topline
-# "{coins} ZEC" :1668; meter button text :1807). Catches are
-# therefore probabilistic: meter charges +13 per ZEC catch (:1390)
-# and a "frenzy" catch fills it outright (:1395), so a 45 s Classic
-# run (ROUND_MS 45_000 :9, spawns every 600->235 ms :1353) fills
-# the meter with wide margin under active sweeping; if run 1 ends
-# bonked or short, run 2 (of the 3 free hunts) retries the Goblin
-# shot. Hazards (FUD/fiat/banker) cost a life on contact (:1865) —
-# a bonked run is a possible outcome and is recorded, not hidden.
+# aria-hidden (App.tsx:1675-1683) — no driver can see them. The
+# driver moves Zert by tapping lanes on the arena's own pointer
+# surface: the .arena onPointerDown (App.tsx:1654-1664) sets
+# Zert's lane to floor(x/rect.width*4) of the tap — the input the
+# client itself advertises ("MOVE — Tap a lane", :1726; Zert
+# renders at LANES[lane] = 16/38.5/61.5/84% , :38/:1682). The
+# catch test (:1377) is entity.y in [76,94] while entity.lane ==
+# Zert's lane, so a 0,1,2,3 tap cycle at ~0.55 s dwell puts Zert
+# in each falling coin's lane for part of its ~0.6 s catch
+# window; the HUD coin counter ("{coins} ZEC" topline, :1668)
+# polled between cycles is the proof catches accumulate. The
+# arrow buttons (:1812/:1816) are a fallback only, used when a
+# live dump proves their nodes carry bounds. Catches stay
+# probabilistic: meter charges +13 per ZEC catch (:1390) and a
+# "frenzy" catch fills it outright (:1395); a 45 s Classic run
+# (ROUND_MS 45_000 :9, TICK_MS 45 :37, spawns every 600->235 ms
+# :1353, ~64% ZEC / ~31% hazard / ~5% frenzy) usually fills the
+# meter under active sweeping, and the walk spends up to all 3
+# free hunts on the Goblin shot. Hazards (FUD/fiat/banker) cost
+# a life on contact (:1865) — a bonked run is a possible outcome
+# and is recorded, not hidden; it still saves, so it still
+# unlocks the board shot.
 #
 # GOBLIN WINDOW: Goblin Mode lasts 6500 ms (:1306). On the poll
 # that first shows "UNLEASH GOBLIN MODE" the driver taps it and
@@ -701,6 +741,62 @@ scroll_until() { # $1 = substring, $2 = max swipes; leaves the found dump in $TM
 
 # --- the walk --------------------------------------------------------------
 goblin_ok="0"; gameplay_ok="0"; runs_used="0"
+any_run_saved="0"   # r4: frame 06 gates on a completed run, not shot success
+run_card_seen="0"   # set by play_run when its own poll sees the result card
+
+identify_arena() { # $1 = live play dump -> stdout: the python report
+  # Finds the arena node as the first large ancestor (w>=600,
+  # h>=500) of the "{coins} ZEC" topline text node (App.tsx:1668;
+  # the topline is a direct child of .arena, :1654) and prints:
+  #   ARENA x1 y1 x2 y2
+  #   TAPS x y x y x y x y      (lane-quarter centers, mid-height)
+  #   ZERTCAND x1 y1 x2 y2 cxfrac=...  (a textless lower-band child
+  #     of the arena — the .zert node, App.tsx:1682: its center-x
+  #     fraction tracks LANES[lane] = 16/38.5/61.5/84%, :38)
+  # Prints nothing when the topline or a qualifying ancestor is
+  # absent; the caller falls back per the r4 rules in the header.
+  python3 - "$1" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    sys.exit(0)
+def bounds(n):
+    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds") or "")
+    return tuple(int(v) for v in m.groups()) if m else None
+parent = {}
+target = None
+def walk(n, par):
+    global target
+    parent[id(n)] = par
+    if target is None and re.fullmatch(r"\d+ ZEC", (n.get("text") or "").strip()):
+        target = n
+    for c in n:
+        walk(c, n)
+walk(root, None)
+if target is None:
+    sys.exit(0)
+node = target
+while node is not None:
+    b = bounds(node)
+    if b and (b[2] - b[0]) >= 600 and (b[3] - b[1]) >= 500:
+        x1, y1, x2, y2 = b
+        w, h = x2 - x1, y2 - y1
+        y = y1 + h // 2
+        pts = []
+        for i in range(4):
+            pts.append("%d %d" % (x1 + (2 * i + 1) * w // 8, y))
+        print("ARENA %d %d %d %d" % b)
+        print("TAPS " + " ".join(pts))
+        for c in node:
+            cb = bounds(c)
+            if cb and not (c.get("text") or "") and (cb[2] - cb[0]) <= w // 2 and cb[1] >= y1 + h // 2:
+                cx = (cb[0] + cb[2]) // 2
+                print("ZERTCAND %d %d %d %d cxfrac=%.3f" % (cb + ((cx - x1) / w,)))
+        break
+    node = parent.get(id(node))
+PY
+}
 
 play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
   # Precondition: the mode-select screen is up ("START CLASSIC",
@@ -712,6 +808,7 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
     return 1
   fi
   runs_used=$((runs_used + 1))
+  run_card_seen="0"
   log "play: run $runs_used started (Classic)"
   # Wait for the playing HUD: score rack STACK/TIME (App.tsx:1648-1653).
   local i playing="0"
@@ -720,33 +817,82 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
     if dump_ui "$TMPD/play.xml" && grep -q "STACK" "$TMPD/play.xml" && grep -q "TIME" "$TMPD/play.xml"; then playing="1"; break; fi
   done
   if [ "$playing" != "1" ]; then log "play: run never reached the playing HUD"; return 1; fi
+  # r4: PERSIST the live play-phase dump + screencap BEFORE steering
+  # (runs 1-3 lost every play dump in $TMPD), then identify the
+  # arena from that tree.
+  cp "$TMPD/play.xml" "$OUT/hier-play-r${runs_used}-identify.xml" || true
+  adb exec-out screencap -p > "$OUT/play-r${runs_used}-identify.png" 2>/dev/null || true
+  log "play: identify frame play-r${runs_used}-identify.png dims=$(png_dims "$OUT/play-r${runs_used}-identify.png")"
+  local arena_report lane_pts move_mode
+  arena_report="$(identify_arena "$TMPD/play.xml")"
+  lane_pts="$(printf '%s\n' "$arena_report" | sed -n 's/^TAPS //p')"
+  printf '%s\n' "$arena_report" | while IFS= read -r line; do log "play: identify: $line"; done
   local lc rc
   lc="$(node_center "$TMPD/play.xml" "Move Zert left")"
   rc="$(node_center "$TMPD/play.xml" "Move Zert right")"
   log "play: arrow coords left=[$lc] right=[$rc]"
+  # Movement channel (r4 header): arena lane taps are primary; the
+  # arrow path is kept ONLY when the live dump proves those nodes
+  # exist with bounds and the arena could not be identified.
+  if [ -n "$lane_pts" ]; then
+    move_mode="arena"
+  elif [ -n "$lc" ] && [ -n "$rc" ]; then
+    move_mode="arrows"
+  else
+    move_mode="none"
+    log "play: NO movement channel proven (no arena bounds, no arrow nodes) — observing only; the run still plays out for the board gate"
+  fi
+  log "play: movement mode=$move_mode lane_taps=[$lane_pts]"
+  local lane_x lane_y
+  lane_x=($(printf '%s' "$lane_pts" | awk '{print $1, $3, $5, $7}'))
+  lane_y=($(printf '%s' "$lane_pts" | awk '{print $2, $4, $6, $8}'))
+  local tap_i=0 iter=0 poll_n=0 coins_seen_max=0
   local t0; t0="$(date +%s)"
-  while [ $(( $(date +%s) - t0 )) -lt 60 ]; do
-    # Sweep burst: cross the lanes with the client's own controls.
-    if [ -n "$lc" ] && [ -n "$rc" ]; then
+  while [ $(( $(date +%s) - t0 )) -lt 75 ]; do
+    iter=$((iter + 1))
+    # Steer: one lane tap per beat (~0.55 s dwell), cycling lanes
+    # 0,1,2,3 — the arena handler teleports Zert to the tapped
+    # lane (App.tsx:1654-1664), so a steady cycle intersects each
+    # falling coin's catch window (:1377) with ~even odds.
+    if [ "$move_mode" = "arena" ]; then
+      local li=$(( tap_i % 4 ))
+      adb shell input tap "${lane_x[$li]}" "${lane_y[$li]}" >/dev/null 2>&1 || true
+      tap_i=$((tap_i + 1))
+      sleep 0.35
+    elif [ "$move_mode" = "arrows" ]; then
       for xy in "$lc" "$lc" "$rc" "$rc" "$rc" "$lc" "$lc" "$rc"; do
         adb shell input tap $xy >/dev/null 2>&1 || true
         sleep 0.3
       done
+      tap_i=$((tap_i + 8))
     else
-      tap_text "$TMPD/play.xml" "←" || true; sleep 0.3
-      tap_text "$TMPD/play.xml" "→" || true; sleep 0.3
+      sleep 2
+      tap_i=$((tap_i + 6))
     fi
+    # Poll gate: every 6th beat in arena mode (~3.5 s of motion),
+    # every 2nd beat in arrows mode (one beat is an 8-tap burst),
+    # every beat when there is no movement channel to exercise.
+    case "$move_mode" in
+      arena)  [ $((iter % 6)) -ne 0 ] && continue ;;
+      arrows) [ $((iter % 2)) -ne 0 ] && continue ;;
+    esac
+    # Poll beat: dump, PERSIST it (r4), and read the HUD off it.
     if [ "$(fg_pkg)" != "$PKG" ]; then adb shell am start -W -n "$ACT" >/dev/null 2>&1 || true; fi
-    dump_ui "$TMPD/play.xml" || continue
+    poll_n=$((poll_n + 1))
+    if ! dump_ui "$TMPD/play.xml"; then log "play: poll $poll_n dump failed"; continue; fi
+    cp "$TMPD/play.xml" "$OUT/hier-play-r${runs_used}-poll${poll_n}.xml" || true
     if grep -q "HOARD SECURED\|ZERT GOT BONKED" "$TMPD/play.xml"; then
-      log "play: run $runs_used ended (result card up)"
+      log "play: run $runs_used ended (result card up; coins max observed=${coins_seen_max})"
+      run_card_seen="1"
       return 0
     fi
-    local coins
+    local coins lives
     coins="$(grep -oE '[0-9]+ ZEC' "$TMPD/play.xml" | head -n 1 | grep -oE '^[0-9]+' || true)"
-    log "play: poll — coins=${coins:-?} meter_text=$(grep -oE 'FRENZY [0-9]+%|UNLEASH GOBLIN MODE|GOBLIN MODE: FERAL' "$TMPD/play.xml" | head -n 1)"
+    lives="$(grep -o '●' "$TMPD/play.xml" | wc -l | tr -d ' ')"
+    if [ -n "$coins" ] && [ "$coins" -gt "$coins_seen_max" ]; then coins_seen_max="$coins"; fi
+    log "play: poll $poll_n — coins=${coins:-?} (max ${coins_seen_max}) lives~${lives:-?} taps=$tap_i mode=$move_mode meter_text=$(grep -oE 'FRENZY [0-9]+%|UNLEASH GOBLIN MODE|GOBLIN MODE: FERAL' "$TMPD/play.xml" | head -n 1)"
     if [ "$want_gp" = "1" ] && [ "$gameplay_ok" != "1" ] && [ -n "$coins" ] && [ "$coins" -ge 2 ]; then
-      shot "04-gameplay.png" "playing HUD confirmed (STACK/TIME, App.tsx:1648); arena topline ${coins} ZEC (:1668) — run in motion"
+      shot "04-gameplay.png" "playing HUD confirmed (STACK/TIME, App.tsx:1648); arena topline ${coins} ZEC (:1668) — catches proven accumulating under lane-tap steering (mode=$move_mode); polls in hier-play-r${runs_used}-poll*.xml"
       gameplay_ok="1"
     fi
     if [ "$want_gob" = "1" ] && [ "$goblin_ok" != "1" ] && grep -q "UNLEASH GOBLIN MODE" "$TMPD/play.xml"; then
@@ -754,12 +900,13 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
       if tap_text "$TMPD/play.xml" "UNLEASH GOBLIN MODE"; then
         # Screencap FIRST (frame lands ~1 s into the window), confirm after.
         shot "05-goblin-mode.png" "Goblin Mode activated from UNLEASH GOBLIN MODE (:1807); confirm dump follows in hier-goblin-confirm.xml"
+        rm -f "$TMPD/goblin.xml"
         if dump_ui "$TMPD/goblin.xml" && grep -q "GOBLIN MODE: FERAL" "$TMPD/goblin.xml"; then
           goblin_confirm="FERAL text in confirming dump"
-          cp "$TMPD/goblin.xml" "$OUT/hier-goblin-confirm.xml" || true
         else
           goblin_confirm="FERAL text NOT in confirming dump (window may have lapsed before the dump; the frame was capped ~1 s after the tap)"
         fi
+        [ -f "$TMPD/goblin.xml" ] && cp "$TMPD/goblin.xml" "$OUT/hier-goblin-confirm.xml" || true
         log "play: goblin confirm: $goblin_confirm"
         goblin_ok="1"
       fi
@@ -768,12 +915,14 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
       if [ "$want_gp" != "1" ] || [ "$gameplay_ok" = "1" ]; then
         # Nothing left to hunt this run — but a run still in flight
         # must be played out so its score saves for the board shot.
-        log "play: this run's shots are in; playing out to the result card"
+        if [ "$want_gp" = "1" ] || [ "$want_gob" = "1" ]; then
+          log "play: this run's shots are in; playing out to the result card"
+        fi
         want_gp="0"; want_gob="0"
       fi
     fi
   done
-  log "play: run $runs_used loop budget exhausted (round is 45 s; the result card may lag the loop)"
+  log "play: run $runs_used loop budget exhausted (round is 45 s; the result card may lag the loop; coins max observed=${coins_seen_max})"
   return 0
 }
 
@@ -782,12 +931,15 @@ wait_result_card() { # poll until the result card is up and the save reconciled
   for i in $(seq 1 20); do
     if dump_ui "$TMPD/res.xml" && grep -q "HOARD SECURED\|ZERT GOT BONKED" "$TMPD/res.xml"; then
       if grep -q "Run saved" "$TMPD/res.xml" || { grep -q "Insert next coin" "$TMPD/res.xml" && ! grep -q "Reconciling run" "$TMPD/res.xml"; }; then
+        cp "$TMPD/res.xml" "$OUT/hier-result-card.xml" || true # r4: persist
+        log "walk: result card up, save reconciled (run $runs_used)"
         return 0
       fi
     fi
     sleep 3
   done
   dump_ui "$TMPD/res.xml" || true
+  cp "$TMPD/res.xml" "$OUT/hier-result-card.xml" || true # r4: persist either way
   grep -q "HOARD SECURED\|ZERT GOT BONKED" "$TMPD/res.xml"
 }
 
@@ -882,38 +1034,47 @@ else
           cp "$TMPD/ms.xml" "$OUT/hier-mode-select.xml" || true
           # -- 03 mode select (three modes, :1744/:1747/:1750) --
           shot "03-mode-select.png" "difficulty grid: CLASSIC / DOUBLE FRENZY / TRIPLE FRENZY cards (:1744-1750) after ONE PLAY RESERVED"
-          # -- runs: gameplay + goblin (retry the goblin on run 2) --
+          # -- runs: hunt 04/05 across up to all 3 free hunts (r4;
+          # run 3's walk stopped after 2 and never retried 04) --
           play_run 1 1 || true
-          wait_result_card || true
-          if [ "$gameplay_ok" != "1" ]; then miss "04-gameplay.png" "run 1 never showed a live HUD with >=2 ZEC caught"; fi
-          if [ "$goblin_ok" != "1" ]; then
-            if dump_ui "$TMPD/res.xml" && grep -q "Insert next coin" "$TMPD/res.xml"; then
-              log "walk: goblin shot missed on run 1 — spending free hunt 2 on a dedicated retry"
-              if tap_text "$TMPD/res.xml" "Insert next coin"; then
-                ms2="0"
-                for i in $(seq 1 15); do
-                  sleep 3
-                  if dump_ui "$TMPD/ms.xml" && grep -q "START CLASSIC" "$TMPD/ms.xml"; then ms2="1"; break; fi
-                done
-                if [ "$ms2" = "1" ]; then
-                  play_run 0 1 || true
-                  wait_result_card || true
-                fi
-              fi
+          if wait_result_card || [ "$run_card_seen" = "1" ]; then any_run_saved="1"; fi
+          while [ "$runs_used" -lt 3 ] && { [ "$gameplay_ok" != "1" ] || [ "$goblin_ok" != "1" ]; }; do
+            if ! { dump_ui "$TMPD/res.xml" && grep -q "Insert next coin" "$TMPD/res.xml" && tap_text "$TMPD/res.xml" "Insert next coin"; }; then
+              log "walk: a retry is wanted but no Insert next coin control is up — stopping run retries"
+              break
             fi
-            if [ "$goblin_ok" != "1" ]; then miss "05-goblin-mode.png" "meter never reached UNLEASH inside the played runs (blind play; catches are probabilistic — see lane log)"; fi
-          fi
+            ms2="0"
+            for i in $(seq 1 15); do
+              sleep 3
+              if dump_ui "$TMPD/ms.xml" && grep -q "START CLASSIC" "$TMPD/ms.xml"; then ms2="1"; break; fi
+            done
+            if [ "$ms2" != "1" ]; then log "walk: mode select never re-rendered for the retry"; break; fi
+            wgp="0"; wgob="0"
+            [ "$gameplay_ok" != "1" ] && wgp="1"
+            [ "$goblin_ok" != "1" ] && wgob="1"
+            log "walk: spending free hunt $((runs_used + 1)) on a retry (want_gameplay=$wgp want_goblin=$wgob)"
+            play_run "$wgp" "$wgob" || true
+            if wait_result_card || [ "$run_card_seen" = "1" ]; then any_run_saved="1"; fi
+          done
+          if [ "$gameplay_ok" != "1" ]; then miss "04-gameplay.png" "no played run showed a live HUD with >=2 ZEC caught (lane-tap steering; per-poll coins in the lane log + hier-play-* dumps)"; fi
+          if [ "$goblin_ok" != "1" ]; then miss "05-goblin-mode.png" "meter never reached UNLEASH inside the played runs (blind play; catches are probabilistic — see lane log)"; fi
         fi
       fi
       # -- 06 leaderboard (below the game column; scroll to THE DEEP CAVE, :1830) --
-      if [ "$goblin_ok" = "1" ] || [ "$gameplay_ok" = "1" ]; then
+      # r4: gated on a COMPLETED RUN (a result card seen this walk),
+      # never on 04/05 shot success — run 3 skipped this block with
+      # two saved runs in hand because neither gameplay shot had
+      # confirmed (a driver-guard casualty).
+      if [ "$any_run_saved" = "1" ]; then
         if scroll_until "THE DEEP CAVE" 8; then
-          if grep -q "No ranked goblins yet" "$TMPD/scroll.xml"; then board_state="empty (no seeded rivals — the truthful fresh-board state)"; else board_state="populated (the walk's saved run is ranked)"; fi
+          if grep -q "No ranked goblins yet" "$TMPD/scroll.xml"; then board_state="empty (no ranked rows — the truthful fresh-board state)"; else board_state="populated (ranked rows on the production board — the walk's own saved run and/or rows left by earlier sessions on the live host; this IS the real board, not a seeded fixture)"; fi
           cp "$TMPD/scroll.xml" "$OUT/hier-leaderboard.xml" || true
           shot "06-leaderboard.png" "THE DEEP CAVE board (:1830-1831, Classic top goblins); board state: $board_state"
         else
           miss "06-leaderboard.png" "THE DEEP CAVE never entered the viewport after 8 scrolls"
         fi
+      else
+        miss "06-leaderboard.png" "no run completed to a result card this walk (board shot is gated on a completed run, r4)"
       fi
     fi
   fi
