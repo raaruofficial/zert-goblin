@@ -62,6 +62,42 @@
 # Hunt use: up to all 3 free hunts are spent retrying whichever
 # of 04/05 is still missing (run 3's walk stopped at 2).
 #
+# DRIVER r5 (run-4 fix): run 4's persistence fix paid off — its
+# filed play dumps prove the run's detectors keyed on string
+# forms this client's accessibility tree does not contain, while
+# an unsteered Zert caught 16 ZEC and held the meter at 100% for
+# two polls, unobserved. The three forms (SCREENSHOT_RUN run 4):
+# (1) the coin counter is TWO sibling text nodes — a digit node
+# and a " ZEC" label node (:1668) — so every "[0-9]+ ZEC" grep
+# since r1, and r4's arena anchor, could never match; (2) the
+# meter Button's tree text is its aria-label form, "Activate
+# Goblin Mode, N percent charged" (:1804) — "FRENZY N%" /
+# "UNLEASH GOBLIN MODE" (:1807) never appear as tree text, and
+# the tappable node at full charge is the Button itself; while
+# Goblin Mode runs, the label reads "Goblin Mode active" (:1804);
+# (3) the arrow buttons carry their labels in text= (:1812/
+# :1816) — node_center searched content-desc, hence four runs
+# of empty coords. r5 parses each play dump ONCE as a tree
+# (hud_read, python): coins = the digit node adjacent to the
+# " ZEC" label (preceding on the topline, following on the
+# result card); meter %/full-charge and the activation tap
+# target from the Button's text; arena anchored on the " ZEC"
+# node (r4's ancestor rule, now reachable); Zert's node and
+# lane fraction read from the same parse; arrows via text=.
+# Every r5 detector was verified OFFLINE against run 4's filed
+# dumps before this driver shipped (the r3 discipline): coins
+# 0->1->3->5->8->15 across identify/polls and 16 on the result
+# card, meter 13->39->65->100 with full-charge at polls 4-5,
+# arena [20,300][804,1422], Zert cxfrac 0.386, arrow centers
+# exact. Also: (4) the run-retry precondition no longer requires
+# the result card's "Insert next coin" string (run 4's card
+# lacked it while plays remained) — a saved card plus a fresh
+# access read of the launch control's free-hunts form suffices,
+# and paid controls are never tapped; (5) after the standard
+# board shot, a board CANDIDATE is captured 2 viewports past
+# the heading (run 4's frame cut the table at row #1) — the
+# filing step keeps the better-centered frame.
+#
 # DRIVER r2 (run-1 fix): run 1 applied the wm override immediately
 # after boot, BEFORE any app launched and before the first dump —
 # and `uiautomator dump` then failed on every call from the first
@@ -104,8 +140,11 @@
 #   04-gameplay.png      Classic run in motion. [four-lane collector,
 #                        45-second runs: score rack STACK/TIME/COMBO
 #                        :1648-1653]
-#   05-goblin-mode.png   Goblin Mode active. ["GOBLIN MODE: FERAL"
-#                        :1807; activation is player-tapped at meter
+#   05-goblin-mode.png   Goblin Mode active. [frame shows the
+#                        visible "GOBLIN MODE: FERAL" :1807; the
+#                        tree confirms via the meter Button's
+#                        "Goblin Mode active" label :1804;
+#                        activation is player-tapped at meter
 #                        100, goblinMs 6500 :1306]
 #   06-leaderboard.png   THE DEEP CAVE board (:1830/:1831), shot
 #                        after the walk's own run has saved, so the
@@ -126,8 +165,9 @@
 # catch test (:1377) is entity.y in [76,94] while entity.lane ==
 # Zert's lane, so a 0,1,2,3 tap cycle at ~0.55 s dwell puts Zert
 # in each falling coin's lane for part of its ~0.6 s catch
-# window; the HUD coin counter ("{coins} ZEC" topline, :1668)
-# polled between cycles is the proof catches accumulate. The
+# window; the HUD coin counter (the digit sibling of the
+# " ZEC" topline label, :1668 — hud_read, driver r5) polled
+# between cycles is the proof catches accumulate. The
 # arrow buttons (:1812/:1816) are a fallback only, used when a
 # live dump proves their nodes carry bounds. Catches stay
 # probabilistic: meter charges +13 per ZEC catch (:1390) and a
@@ -141,11 +181,13 @@
 # unlocks the board shot.
 #
 # GOBLIN WINDOW: Goblin Mode lasts 6500 ms (:1306). On the poll
-# that first shows "UNLEASH GOBLIN MODE" the driver taps it and
-# screencaps IMMEDIATELY (before the confirming dump), so the frame
-# lands ~1 s into the window; the confirming dump's "GOBLIN MODE:
-# FERAL" (or its absence, if the window lapsed) is recorded in the
-# manifest next to the shot.
+# whose meter Button text first reads 100 percent charged
+# (:1804 — the tree form of the visible "UNLEASH GOBLIN MODE",
+# :1807) the driver taps the Button node itself and screencaps
+# IMMEDIATELY (before the confirming dump), so the frame lands
+# ~1 s into the window; the confirming dump's "Goblin Mode
+# active" label (:1804) (or its absence, if the window lapsed)
+# is recorded in the manifest next to the shot.
 #
 # NOT CAPTURABLE IN THIS LANE (stated, not worked around): the
 # "Connect with Seeker" door form (App.tsx:1711/:579). The door
@@ -739,62 +781,199 @@ scroll_until() { # $1 = substring, $2 = max swipes; leaves the found dump in $TM
   grep -q "$needle" "$TMPD/scroll.xml"
 }
 
+next_run_control() { # find + tap a FREE next-run control; 0 on success
+  # r5 retry precondition (run-4 lesson): the result card's
+  # "Insert next coin" string is sufficient but NOT necessary —
+  # run 4's card lacked it while plays remained unspent, because
+  # the access state on the card was a stale read. Accept instead:
+  # the card's control if present, else scroll back toward the
+  # page top and re-read the launch control — a live-session
+  # "Insert coin · N free hunt(s) ready" form (App.tsx:1715
+  # ternary) with N >= 1 proves free plays remain, and tapping
+  # "Insert coin" starts the next run exactly as the walk's
+  # first insert did. PAID controls ("Top up 4 plays · $1",
+  # "Buy 4 plays · $1") are never tapped — the lane holds no
+  # funds and must not manufacture plays.
+  local k
+  if dump_ui "$TMPD/res.xml" && tap_text "$TMPD/res.xml" "Insert next coin"; then
+    log "walk: retry via the result card's Insert next coin"
+    return 0
+  fi
+  for k in 1 2 3 4; do
+    adb shell input swipe 412 620 412 1500 350 >/dev/null 2>&1 || true
+    sleep 1
+    if dump_ui "$TMPD/res.xml"; then
+      if tap_text "$TMPD/res.xml" "Insert next coin"; then
+        log "walk: retry via Insert next coin (found after scroll-up $k)"
+        return 0
+      fi
+      if grep -qE "Insert coin · [1-9][0-9]* free hunt" "$TMPD/res.xml" && tap_text "$TMPD/res.xml" "Insert coin"; then
+        log "walk: retry via fresh access read — launch control shows free hunts remaining"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 # --- the walk --------------------------------------------------------------
 goblin_ok="0"; gameplay_ok="0"; runs_used="0"
 any_run_saved="0"   # r4: frame 06 gates on a completed run, not shot success
 run_card_seen="0"   # set by play_run when its own poll sees the result card
 
-identify_arena() { # $1 = live play dump -> stdout: the python report
-  # Finds the arena node as the first large ancestor (w>=600,
-  # h>=500) of the "{coins} ZEC" topline text node (App.tsx:1668;
-  # the topline is a direct child of .arena, :1654) and prints:
-  #   ARENA x1 y1 x2 y2
-  #   TAPS x y x y x y x y      (lane-quarter centers, mid-height)
-  #   ZERTCAND x1 y1 x2 y2 cxfrac=...  (a textless lower-band child
-  #     of the arena — the .zert node, App.tsx:1682: its center-x
-  #     fraction tracks LANES[lane] = 16/38.5/61.5/84%, :38)
-  # Prints nothing when the topline or a qualifying ancestor is
-  # absent; the caller falls back per the r4 rules in the header.
+hud_read() { # $1 = dump file -> stdout: KEY='value' lines (eval-safe)
+  # DRIVER r5: ONE python tree parse of a play/result dump; every
+  # HUD detector reads from it (header, run-4 forms 1-3):
+  #   HUD_COINS       digit node adjacent to the " ZEC" label node
+  #                   (preceding on the playing topline :1668,
+  #                   following on the result card)
+  #   HUD_LIVES       total ● glyphs across node texts (topline)
+  #   HUD_METER_PCT   from the meter Button's text, "Activate
+  #                   Goblin Mode, N percent charged" (:1804)
+  #   HUD_METER_FULL  1 when N >= 100 (the UNLEASH condition)
+  #   HUD_METER_BTN   "x y" center of that Button — the tap target
+  #                   at full charge; while Goblin Mode runs the
+  #                   label reads "Goblin Mode active" (:1804) and
+  #                   HUD_GOBLIN_ACTIVE=1
+  #   HUD_ARENA       "x1 y1 x2 y2" of the first large ancestor
+  #                   (w>=600, h>=500) of the " ZEC" node (r4's
+  #                   ancestor rule, re-anchored); playing HUD only
+  #   HUD_TAPS        lane-quarter centers at arena mid-height
+  #   HUD_ZERT        the textless lower-band arena descendant
+  #                   (.zert :1682) + HUD_ZERT_CXFRAC vs
+  #                   LANES = 16/38.5/61.5/84% (:38)
+  #   HUD_ARROW_L/R   "x y" centers of the arrow Buttons, whose
+  #                   labels live in text= (:1812/:1816)
+  #   HUD_PLAYING / HUD_RESULT  state flags (STACK/TIME rack;
+  #                   HOARD SECURED / ZERT GOT BONKED card)
+  # Verified offline against run 4's filed dumps before dispatch
+  # (coins 0->15 across the polls, 16 on the card; meter
+  # 13->39->65->100, FULL at polls 4-5; arena/zert/arrows exact).
   python3 - "$1" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-try:
-    root = ET.parse(sys.argv[1]).getroot()
-except Exception:
-    sys.exit(0)
+
 def bounds(n):
     m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds") or "")
     return tuple(int(v) for v in m.groups()) if m else None
+
+def center(b):
+    return "%d %d" % ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+
+out = {"HUD_COINS": "", "HUD_LIVES": "", "HUD_METER_PCT": "", "HUD_METER_FULL": 0,
+       "HUD_METER_BTN": "", "HUD_ARENA": "", "HUD_TAPS": "", "HUD_ZERT": "",
+       "HUD_ZERT_CXFRAC": "", "HUD_PLAYING": 0, "HUD_RESULT": 0,
+       "HUD_ARROW_L": "", "HUD_ARROW_R": "", "HUD_GOBLIN_ACTIVE": 0}
+
+def emit():
+    for k, v in out.items():
+        print("%s='%s'" % (k, v))
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    emit(); sys.exit(0)
+
+order = []
 parent = {}
-target = None
 def walk(n, par):
-    global target
     parent[id(n)] = par
-    if target is None and re.fullmatch(r"\d+ ZEC", (n.get("text") or "").strip()):
-        target = n
+    order.append(n)
     for c in n:
         walk(c, n)
 walk(root, None)
-if target is None:
-    sys.exit(0)
-node = target
-while node is not None:
-    b = bounds(node)
-    if b and (b[2] - b[0]) >= 600 and (b[3] - b[1]) >= 500:
-        x1, y1, x2, y2 = b
-        w, h = x2 - x1, y2 - y1
-        y = y1 + h // 2
-        pts = []
-        for i in range(4):
-            pts.append("%d %d" % (x1 + (2 * i + 1) * w // 8, y))
-        print("ARENA %d %d %d %d" % b)
-        print("TAPS " + " ".join(pts))
-        for c in node:
-            cb = bounds(c)
-            if cb and not (c.get("text") or "") and (cb[2] - cb[0]) <= w // 2 and cb[1] >= y1 + h // 2:
-                cx = (cb[0] + cb[2]) // 2
-                print("ZERTCAND %d %d %d %d cxfrac=%.3f" % (cb + ((cx - x1) / w,)))
+
+def text(n):
+    return n.get("text") or ""
+
+texts = [text(n) for n in order]
+joined = "\n".join(texts)
+if "STACK" in texts and "TIME" in texts:
+    out["HUD_PLAYING"] = 1
+if "HOARD SECURED" in joined or "ZERT GOT BONKED" in joined:
+    out["HUD_RESULT"] = 1
+out["HUD_LIVES"] = sum(t.count("●") for t in texts)
+
+# coins: digit-only node ADJACENT to the " ZEC" label node —
+# preceding on the playing topline ({coins} then " ZEC", :1668),
+# following on the result card (label above value). No node in
+# any dump carries a merged "N ZEC" string (run-4 form 1).
+zec_node = None
+for i, n in enumerate(order):
+    if text(n).strip() != "ZEC":
+        continue
+    b = bounds(n)
+    if not b or b[2] <= b[0]:
+        continue  # off-screen duplicate (bounds [0,0][0,0])
+    for j in (i - 1, i + 1):
+        if 0 <= j < len(order) and text(order[j]).strip().isdigit():
+            out["HUD_COINS"] = text(order[j]).strip()
+            zec_node = n
+            break
+    if zec_node is not None:
         break
-    node = parent.get(id(node))
+if zec_node is not None and out["HUD_PLAYING"] == 1:
+    # arena: first large ancestor of the ZEC node. Playing HUD
+    # only — on the result card the same rule lands on the card
+    # container, which is not a steering surface.
+    node = zec_node
+    while node is not None:
+        b = bounds(node)
+        if b and (b[2] - b[0]) >= 600 and (b[3] - b[1]) >= 500:
+            x1, y1, x2, y2 = b
+            w, h = x2 - x1, y2 - y1
+            out["HUD_ARENA"] = "%d %d %d %d" % b
+            y = y1 + h // 2
+            out["HUD_TAPS"] = " ".join(
+                "%d %d" % (x1 + (2 * i + 1) * w // 8, y) for i in range(4))
+            best = None
+            stack = list(node)
+            while stack:
+                c = stack.pop()
+                stack.extend(list(c))
+                cb = bounds(c)
+                if cb and not text(c).strip():
+                    cw, ch = cb[2] - cb[0], cb[3] - cb[1]
+                    cy = (cb[1] + cb[3]) // 2
+                    if (x1 <= cb[0] and cb[2] <= x2 and cy >= y1 + (55 * h) // 100
+                            and 40 <= cw <= w // 2 and 40 <= ch <= h // 2):
+                        area = cw * ch
+                        if best is None or area > best[0]:
+                            best = (area, cb)
+            if best is not None:
+                cb = best[1]
+                out["HUD_ZERT"] = "%d %d %d %d" % cb
+                out["HUD_ZERT_CXFRAC"] = "%.3f" % (((cb[0] + cb[2]) // 2 - x1) / w)
+            break
+        node = parent.get(id(node))
+
+# meter Button (run-4 form 2): tree text is the aria-label form.
+for n in order:
+    t = text(n)
+    m = re.fullmatch(r"Activate Goblin Mode, (\d+) percent charged", t.strip())
+    if m:
+        out["HUD_METER_PCT"] = m.group(1)
+        if int(m.group(1)) >= 100:
+            out["HUD_METER_FULL"] = 1
+        b = bounds(n)
+        if b:
+            out["HUD_METER_BTN"] = center(b)
+    if t.strip() == "Goblin Mode active":
+        out["HUD_GOBLIN_ACTIVE"] = 1
+        b = bounds(n)
+        if b:
+            out["HUD_METER_BTN"] = center(b)
+
+# arrows (run-4 form 3): labels in text=, never content-desc.
+for n in order:
+    t = text(n).strip()
+    if t == "Move Zert left":
+        b = bounds(n)
+        if b: out["HUD_ARROW_L"] = center(b)
+    elif t == "Move Zert right":
+        b = bounds(n)
+        if b: out["HUD_ARROW_R"] = center(b)
+
+emit()
 PY
 }
 
@@ -823,14 +1002,16 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
   cp "$TMPD/play.xml" "$OUT/hier-play-r${runs_used}-identify.xml" || true
   adb exec-out screencap -p > "$OUT/play-r${runs_used}-identify.png" 2>/dev/null || true
   log "play: identify frame play-r${runs_used}-identify.png dims=$(png_dims "$OUT/play-r${runs_used}-identify.png")"
-  local arena_report lane_pts move_mode
-  arena_report="$(identify_arena "$TMPD/play.xml")"
-  lane_pts="$(printf '%s\n' "$arena_report" | sed -n 's/^TAPS //p')"
-  printf '%s\n' "$arena_report" | while IFS= read -r line; do log "play: identify: $line"; done
+  # r5: one tree parse (hud_read) identifies the arena, Zert and
+  # both control channels from the SAME persisted identify dump.
+  eval "$(hud_read "$TMPD/play.xml")"
+  local lane_pts move_mode
+  lane_pts="$HUD_TAPS"
+  log "play: identify: ARENA=[$HUD_ARENA] TAPS=[$HUD_TAPS] ZERT=[$HUD_ZERT] cxfrac=$HUD_ZERT_CXFRAC"
   local lc rc
-  lc="$(node_center "$TMPD/play.xml" "Move Zert left")"
-  rc="$(node_center "$TMPD/play.xml" "Move Zert right")"
-  log "play: arrow coords left=[$lc] right=[$rc]"
+  lc="$HUD_ARROW_L"
+  rc="$HUD_ARROW_R"
+  log "play: arrow coords (text= labels, :1812/:1816) left=[$lc] right=[$rc]"
   # Movement channel (r4 header): arena lane taps are primary; the
   # arrow path is kept ONLY when the live dump proves those nodes
   # exist with bounds and the arena could not be identified.
@@ -886,25 +1067,40 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
       run_card_seen="1"
       return 0
     fi
+    # r5: the whole HUD state comes from the one tree parse —
+    # coins from the digit sibling of the " ZEC" label, meter %
+    # from the Button's aria-label text (run-4 forms 1-2; the
+    # r1-r4 greps for "[0-9]+ ZEC" / "FRENZY N%" could never
+    # match this tree).
+    eval "$(hud_read "$TMPD/play.xml")"
     local coins lives
-    coins="$(grep -oE '[0-9]+ ZEC' "$TMPD/play.xml" | head -n 1 | grep -oE '^[0-9]+' || true)"
-    lives="$(grep -o '●' "$TMPD/play.xml" | wc -l | tr -d ' ')"
+    coins="$HUD_COINS"
+    lives="$HUD_LIVES"
     if [ -n "$coins" ] && [ "$coins" -gt "$coins_seen_max" ]; then coins_seen_max="$coins"; fi
-    log "play: poll $poll_n — coins=${coins:-?} (max ${coins_seen_max}) lives~${lives:-?} taps=$tap_i mode=$move_mode meter_text=$(grep -oE 'FRENZY [0-9]+%|UNLEASH GOBLIN MODE|GOBLIN MODE: FERAL' "$TMPD/play.xml" | head -n 1)"
+    log "play: poll $poll_n — coins=${coins:-?} (max ${coins_seen_max}) lives=${lives:-?} meter_pct=${HUD_METER_PCT:-?} full=$HUD_METER_FULL zert_cxfrac=${HUD_ZERT_CXFRAC:-?} taps=$tap_i mode=$move_mode"
     if [ "$want_gp" = "1" ] && [ "$gameplay_ok" != "1" ] && [ -n "$coins" ] && [ "$coins" -ge 2 ]; then
       shot "04-gameplay.png" "playing HUD confirmed (STACK/TIME, App.tsx:1648); arena topline ${coins} ZEC (:1668) — catches proven accumulating under lane-tap steering (mode=$move_mode); polls in hier-play-r${runs_used}-poll*.xml"
       gameplay_ok="1"
     fi
-    if [ "$want_gob" = "1" ] && [ "$goblin_ok" != "1" ] && grep -q "UNLEASH GOBLIN MODE" "$TMPD/play.xml"; then
-      log "play: meter full — activating Goblin Mode (window 6500 ms, :1306)"
-      if tap_text "$TMPD/play.xml" "UNLEASH GOBLIN MODE"; then
+    if [ "$want_gob" = "1" ] && [ "$goblin_ok" != "1" ] && [ "$HUD_METER_FULL" = "1" ] && [ -n "$HUD_METER_BTN" ]; then
+      # r5: full charge reads off the meter Button's own text and
+      # the Button node itself is the tap target (run-4 form 2 —
+      # "UNLEASH GOBLIN MODE" is the visible strong :1807, never
+      # a tree text, so no tap_text could ever land it).
+      log "play: meter at 100% — tapping the meter Button itself at $HUD_METER_BTN (window 6500 ms, :1306)"
+      if adb shell input tap $HUD_METER_BTN >/dev/null 2>&1; then
         # Screencap FIRST (frame lands ~1 s into the window), confirm after.
-        shot "05-goblin-mode.png" "Goblin Mode activated from UNLEASH GOBLIN MODE (:1807); confirm dump follows in hier-goblin-confirm.xml"
+        shot "05-goblin-mode.png" "Goblin Mode activated by tapping the meter Button at 100 percent charged (aria-label form :1804; visible state GOBLIN MODE: FERAL :1807); confirm dump follows in hier-goblin-confirm.xml"
         rm -f "$TMPD/goblin.xml"
-        if dump_ui "$TMPD/goblin.xml" && grep -q "GOBLIN MODE: FERAL" "$TMPD/goblin.xml"; then
-          goblin_confirm="FERAL text in confirming dump"
+        if dump_ui "$TMPD/goblin.xml"; then
+          eval "$(hud_read "$TMPD/goblin.xml")"
+          if [ "$HUD_GOBLIN_ACTIVE" = "1" ]; then
+            goblin_confirm="Goblin Mode active (meter Button aria-label, :1804) in confirming dump"
+          else
+            goblin_confirm="Goblin Mode active label NOT in confirming dump (window may have lapsed before the dump; the frame was capped ~1 s after the tap)"
+          fi
         else
-          goblin_confirm="FERAL text NOT in confirming dump (window may have lapsed before the dump; the frame was capped ~1 s after the tap)"
+          goblin_confirm="confirm dump failed (frame was capped ~1 s after the tap)"
         fi
         [ -f "$TMPD/goblin.xml" ] && cp "$TMPD/goblin.xml" "$OUT/hier-goblin-confirm.xml" || true
         log "play: goblin confirm: $goblin_confirm"
@@ -1039,8 +1235,8 @@ else
           play_run 1 1 || true
           if wait_result_card || [ "$run_card_seen" = "1" ]; then any_run_saved="1"; fi
           while [ "$runs_used" -lt 3 ] && { [ "$gameplay_ok" != "1" ] || [ "$goblin_ok" != "1" ]; }; do
-            if ! { dump_ui "$TMPD/res.xml" && grep -q "Insert next coin" "$TMPD/res.xml" && tap_text "$TMPD/res.xml" "Insert next coin"; }; then
-              log "walk: a retry is wanted but no Insert next coin control is up — stopping run retries"
+            if ! next_run_control; then
+              log "walk: a retry is wanted but no free next-run control could be proven (card control absent; fresh access read shows no free hunts) — stopping run retries"
               break
             fi
             ms2="0"
@@ -1075,6 +1271,25 @@ else
         fi
       else
         miss "06-leaderboard.png" "no run completed to a result card this walk (board shot is gated on a completed run, r4)"
+      fi
+      # -- 06 CANDIDATE (r5): scroll 2 viewports PAST the heading so
+      # the ranked table, not just its heading, fills the frame
+      # (run 4's standard frame cut the table at row #1). Saved
+      # under its own name with NO manifest row — the filing step
+      # eyeballs it against the standard frame and keeps the
+      # better-centered one; the in-run 06 above stands either way.
+      if [ "$any_run_saved" = "1" ]; then
+        adb shell input swipe 412 1500 412 620 350 >/dev/null 2>&1 || true
+        sleep 2
+        adb shell input swipe 412 1500 412 620 350 >/dev/null 2>&1 || true
+        sleep 2
+        if [ "$(fg_pkg)" = "$PKG" ] && dump_ui "$TMPD/board-cand.xml"; then
+          cp "$TMPD/board-cand.xml" "$OUT/hier-leaderboard-candidate.xml" || true
+          adb exec-out screencap -p > "$OUT/06-leaderboard-candidate.png" 2>/dev/null || true
+          log "board candidate: 06-leaderboard-candidate.png dims=$(png_dims "$OUT/06-leaderboard-candidate.png") (2 viewports past THE DEEP CAVE heading; filing keeps the better-centered frame)"
+        else
+          log "board candidate: dump failed — no candidate captured"
+        fi
       fi
     fi
   fi
