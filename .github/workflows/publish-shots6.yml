@@ -31,7 +31,6 @@ jobs:
         with:
           name: zert-screenshots-api35
           run-id: 41161361026
-          github-token: <redacted>
           path: artifact-dl
 
       - name: Inspect artifact contents (fail loudly if the evidence core is absent)
