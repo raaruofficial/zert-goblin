@@ -29,8 +29,7 @@ jobs:
       - name: Download run-6 artifact (cross-run)
         uses: actions/download-artifact@v4
         with:
-          run-id: 41161361026
-          merge-multiple: true
+          artifact-ids: 13027491588
           path: artifact-dl
 
       - name: Inspect artifact contents (fail loudly if the evidence core is absent)
