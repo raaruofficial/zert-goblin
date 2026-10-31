@@ -189,6 +189,35 @@
 # active" label (:1804) (or its absence, if the window lapsed)
 # is recorded in the manifest next to the shot.
 #
+# DRIVER r6 (run-6 patch — the run-5 race + truthfulness fix):
+# run 5's meter reached 100% on the run's LAST life; the driver
+# tapped, the bonk beat the activation, the screencap caught
+# the result card ("GOBLIN MODES 0"), and the old code still
+# wrote a captured manifest row + goblin_ok=1 unconditionally
+# (its own verdict.txt carried the honest goblin_confirm=NOT
+# signal underneath). r6 changes three things:
+#   (1) LIVES GATE: activation is attempted ONLY at lives >= 2
+#       (HUD_LIVES, the filled-● count — verified truthful
+#       against run-4/5 dumps). At lives < 2 the meter holds
+#       at 100 (:1390 min(100,...) + button stays enabled) and
+#       play continues unactivated; if no poll ever shows
+#       (full ∧ lives>=2), the run ends unactivated and the
+#       walk spends the next hunt, per the retry loop.
+#   (2) TRUTHFUL COUNTING: the post-tap screencap goes to a
+#       CANDIDATE file (05-goblin-mode-candidate.png, no
+#       manifest row). It becomes frame 05 (shot_file) ONLY
+#       when the confirming dump carries "Goblin Mode active"
+#       (HUD_GOBLIN_ACTIVE=1). Unconfirmed => goblin_ok stays
+#       0, the candidate stays as evidence, and the frame's
+#       manifest row is the MISSING row written at walk end
+#       with the recorded reason.
+#   (3) DENSER POLLS NEAR FULL: in arena mode the poll gate
+#       tightens as the meter climbs (>=50% -> every 2nd beat,
+#       >=80% -> every beat), shrinking the blind window in
+#       which the (full ∧ lives>=2) conjunction can pass
+#       unobserved (run 4 went 65%/2 lives -> 100%/1 life
+#       between two ~3.5 s polls).
+#
 # NOT CAPTURABLE IN THIS LANE (stated, not worked around): the
 # "Connect with Seeker" door form (App.tsx:1711/:579). The door
 # renders only when seekerDoor is true, and seekerDoor =
@@ -382,6 +411,24 @@ shot() { # $1 = filename, $2 = marker note -> screencap + manifest row
   local name="$1" note="$2" dims sha
   recorded="$recorded $name"
   adb exec-out screencap -p > "$OUT/$name" 2>/dev/null || true
+  dims="$(png_dims "$OUT/$name")"
+  sha="$(sha256sum "$OUT/$name" 2>/dev/null | awk '{print $1}')"
+  local size_flag="OK"
+  [ "$dims" = "${WANT_W}x${WANT_H}" ] || size_flag="OFF-SPEC(dims=$dims)"
+  echo "$name | $dims | $size_flag | sha256 $sha | $note" >> "$MANIFEST"
+  log "shot: $name ($dims, $size_flag) — $note"
+  if [ "$size_flag" = "OK" ]; then shots_ok=$((shots_ok + 1)); else shots_missing="$shots_missing $name(off-spec)"; fi
+}
+
+shot_file() { # $1 = filename, $2 = existing source file, $3 = marker note -> file into $OUT + manifest row
+  # r6: like shot(), but the pixels already exist (a candidate
+  # screencap taken before a state confirmation). Used ONLY for
+  # frame 05: the candidate becomes the frame after the paired
+  # dump confirms the state — the manifest row and shots_ok are
+  # written from that confirmation, never from the tap.
+  local name="$1" src="$2" note="$3" dims sha
+  recorded="$recorded $name"
+  cp "$src" "$OUT/$name" 2>/dev/null || true
   dims="$(png_dims "$OUT/$name")"
   sha="$(sha256sum "$OUT/$name" 2>/dev/null | awk '{print $1}')"
   local size_flag="OK"
@@ -820,6 +867,8 @@ next_run_control() { # find + tap a FREE next-run control; 0 on success
 goblin_ok="0"; gameplay_ok="0"; runs_used="0"
 any_run_saved="0"   # r4: frame 06 gates on a completed run, not shot success
 run_card_seen="0"   # set by play_run when its own poll sees the result card
+goblin_held="0"     # r6: set when meter-full was observed only at lives<2 (activation held)
+goblin_fail_reason="" # r6: set when an activation tap went unconfirmed; used as the 05 MISSING reason
 
 hud_read() { # $1 = dump file -> stdout: KEY='value' lines (eval-safe)
   # DRIVER r5: ONE python tree parse of a play/result dump; every
@@ -1027,7 +1076,7 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
   local lane_x lane_y
   lane_x=($(printf '%s' "$lane_pts" | awk '{print $1, $3, $5, $7}'))
   lane_y=($(printf '%s' "$lane_pts" | awk '{print $2, $4, $6, $8}'))
-  local tap_i=0 iter=0 poll_n=0 coins_seen_max=0
+  local tap_i=0 iter=0 poll_n=0 coins_seen_max=0 poll_every=6
   local t0; t0="$(date +%s)"
   while [ $(( $(date +%s) - t0 )) -lt 75 ]; do
     iter=$((iter + 1))
@@ -1050,11 +1099,13 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
       sleep 2
       tap_i=$((tap_i + 6))
     fi
-    # Poll gate: every 6th beat in arena mode (~3.5 s of motion),
-    # every 2nd beat in arrows mode (one beat is an 8-tap burst),
-    # every beat when there is no movement channel to exercise.
+    # Poll gate: every poll_every-th beat in arena mode (6 by
+    # default ~3.5 s of motion; r6 tightens it as the meter
+    # climbs — see the update after hud_read), every 2nd beat in
+    # arrows mode (one beat is an 8-tap burst), every beat when
+    # there is no movement channel to exercise.
     case "$move_mode" in
-      arena)  [ $((iter % 6)) -ne 0 ] && continue ;;
+      arena)  [ $((iter % poll_every)) -ne 0 ] && continue ;;
       arrows) [ $((iter % 2)) -ne 0 ] && continue ;;
     esac
     # Poll beat: dump, PERSIST it (r4), and read the HUD off it.
@@ -1078,6 +1129,14 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
     lives="$HUD_LIVES"
     if [ -n "$coins" ] && [ "$coins" -gt "$coins_seen_max" ]; then coins_seen_max="$coins"; fi
     log "play: poll $poll_n — coins=${coins:-?} (max ${coins_seen_max}) lives=${lives:-?} meter_pct=${HUD_METER_PCT:-?} full=$HUD_METER_FULL zert_cxfrac=${HUD_ZERT_CXFRAC:-?} taps=$tap_i mode=$move_mode"
+    # r6: tighten the poll gate as the meter climbs — the
+    # (full ∧ lives>=2) conjunction is transient (run 4 went
+    # 65%/2 lives -> 100%/1 life between two ~3.5 s polls).
+    if [ "$move_mode" = "arena" ]; then
+      if [ -n "$HUD_METER_PCT" ] && [ "$HUD_METER_PCT" -ge 80 ]; then poll_every=1;
+      elif [ -n "$HUD_METER_PCT" ] && [ "$HUD_METER_PCT" -ge 50 ]; then poll_every=2;
+      else poll_every=6; fi
+    fi
     if [ "$want_gp" = "1" ] && [ "$gameplay_ok" != "1" ] && [ -n "$coins" ] && [ "$coins" -ge 2 ]; then
       shot "04-gameplay.png" "playing HUD confirmed (STACK/TIME, App.tsx:1648); arena topline ${coins} ZEC (:1668) — catches proven accumulating under lane-tap steering (mode=$move_mode); polls in hier-play-r${runs_used}-poll*.xml"
       gameplay_ok="1"
@@ -1087,24 +1146,45 @@ play_run() { # $1 = want_gameplay (0/1), $2 = want_goblin (0/1)
       # the Button node itself is the tap target (run-4 form 2 —
       # "UNLEASH GOBLIN MODE" is the visible strong :1807, never
       # a tree text, so no tap_text could ever land it).
-      log "play: meter at 100% — tapping the meter Button itself at $HUD_METER_BTN (window 6500 ms, :1306)"
-      if adb shell input tap $HUD_METER_BTN >/dev/null 2>&1; then
-        # Screencap FIRST (frame lands ~1 s into the window), confirm after.
-        shot "05-goblin-mode.png" "Goblin Mode activated by tapping the meter Button at 100 percent charged (aria-label form :1804; visible state GOBLIN MODE: FERAL :1807); confirm dump follows in hier-goblin-confirm.xml"
+      # r6 LIVES GATE (the run-5 race): attempt activation ONLY
+      # with a life cushion (lives >= 2). At lives < 2 the run is
+      # one hazard from the result card and the bonk can beat
+      # the 6.5 s window — run 5's tap did exactly that. The
+      # meter holds at 100 (charge clamps at :1390 and the
+      # button stays enabled at :1803), so play continues
+      # unactivated and a later poll in this same run — or the
+      # next hunt — can still present (full ∧ lives>=2).
+      if [ -z "$lives" ] || [ "$lives" -lt 2 ]; then
+        goblin_held="1"
+        log "play: meter at 100% but lives=${lives:-unknown} (<2) — HOLDING activation (r6 lives gate); play continues unactivated"
+      elif adb shell input tap $HUD_METER_BTN >/dev/null 2>&1; then
+        log "play: meter at 100%, lives=$lives — tapping the meter Button itself at $HUD_METER_BTN (window 6500 ms, :1306)"
+        # r6 TRUTHFUL COUNTING: screencap FIRST (~1 s into the
+        # window) but to a CANDIDATE file — no manifest row, no
+        # shots_ok. The candidate becomes frame 05 (shot_file)
+        # ONLY if the confirming dump carries "Goblin Mode
+        # active" (HUD_GOBLIN_ACTIVE=1). An unconfirmed tap
+        # leaves goblin_ok=0, keeps the candidate as evidence,
+        # records the reason, and the run plays on.
+        adb exec-out screencap -p > "$OUT/05-goblin-mode-candidate.png" 2>/dev/null || true
+        log "play: goblin candidate capped: 05-goblin-mode-candidate.png dims=$(png_dims "$OUT/05-goblin-mode-candidate.png")"
         rm -f "$TMPD/goblin.xml"
         if dump_ui "$TMPD/goblin.xml"; then
           eval "$(hud_read "$TMPD/goblin.xml")"
           if [ "$HUD_GOBLIN_ACTIVE" = "1" ]; then
             goblin_confirm="Goblin Mode active (meter Button aria-label, :1804) in confirming dump"
+            shot_file "05-goblin-mode.png" "$OUT/05-goblin-mode-candidate.png" "Goblin Mode CONFIRMED active in the paired confirm dump (meter Button aria-label 'Goblin Mode active' :1804; visible state GOBLIN MODE: FERAL :1807); activated at lives=$lives via the meter Button tap target; candidate-then-confirm counting (driver r6); confirm dump in hier-goblin-confirm.xml"
+            goblin_ok="1"
           else
-            goblin_confirm="Goblin Mode active label NOT in confirming dump (window may have lapsed before the dump; the frame was capped ~1 s after the tap)"
+            goblin_confirm="activation tapped at lives=$lives but 'Goblin Mode active' NOT in confirming dump — frame NOT counted (r6 truthfulness)"
+            goblin_fail_reason="activation tapped (lives=$lives) but the confirming dump carried no 'Goblin Mode active' label; candidate frame kept as evidence only (05-goblin-mode-candidate.png)"
           fi
         else
-          goblin_confirm="confirm dump failed (frame was capped ~1 s after the tap)"
+          goblin_confirm="confirm dump failed after the tap — frame NOT counted (r6 truthfulness)"
+          goblin_fail_reason="activation tapped (lives=$lives) but the confirming dump failed; candidate frame kept as evidence only (05-goblin-mode-candidate.png)"
         fi
         [ -f "$TMPD/goblin.xml" ] && cp "$TMPD/goblin.xml" "$OUT/hier-goblin-confirm.xml" || true
         log "play: goblin confirm: $goblin_confirm"
-        goblin_ok="1"
       fi
     fi
     if [ "$want_gob" != "1" ] || [ "$goblin_ok" = "1" ]; then
@@ -1253,7 +1333,18 @@ else
             if wait_result_card || [ "$run_card_seen" = "1" ]; then any_run_saved="1"; fi
           done
           if [ "$gameplay_ok" != "1" ]; then miss "04-gameplay.png" "no played run showed a live HUD with >=2 ZEC caught (lane-tap steering; per-poll coins in the lane log + hier-play-* dumps)"; fi
-          if [ "$goblin_ok" != "1" ]; then miss "05-goblin-mode.png" "meter never reached UNLEASH inside the played runs (blind play; catches are probabilistic — see lane log)"; fi
+          if [ "$goblin_ok" != "1" ]; then
+            # r6: the 05 MISSING row carries the TRUE reason —
+            # an unconfirmed activation outranks a lives-gate
+            # hold, which outranks the never-full case.
+            if [ -n "$goblin_fail_reason" ]; then
+              miss "05-goblin-mode.png" "$goblin_fail_reason"
+            elif [ "$goblin_held" = "1" ]; then
+              miss "05-goblin-mode.png" "meter reached 100% only at lives<2 in every played run — activation held by the r6 lives gate (the run-5 race); no confirmed activation inside the hunts spent"
+            else
+              miss "05-goblin-mode.png" "meter never reached 100% inside the played runs (blind play; catches are probabilistic — see lane log)"
+            fi
+          fi
         fi
       fi
       # -- 06 leaderboard (below the game column; scroll to THE DEEP CAVE, :1830) --
